@@ -1,3 +1,7 @@
+/**
+ * socket_comm.cpp
+ * Encoding: UTF-8
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,8 +16,54 @@
 #include <signal.h>
 #include <queue>
 #include <mutex>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <time.h>
 
-#define SERVER_PORT 8000
+#include "include/nlohmann/json.hpp"
+using json = nlohmann::json;
+
+// ================ 日志宏定义 =================
+enum LogLevel { LOG_ERR=0, LOG_WARN=1, LOG_INFO=2, LOG_DBG=3 };
+static int GLOBAL_LOG_LEVEL = LOG_DBG;
+
+static inline const char* LOG_TIMESTAMP() {
+    static char buf[32];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    int ms = ts.tv_nsec / 1000000;
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+    return buf;
+}
+
+#define LOG_BASE(lvl, lvlstr, fmt, ...)                                        \
+    do {                                                                       \
+        if ((lvl) <= GLOBAL_LOG_LEVEL) {                                       \
+            if ((lvl) == LOG_DBG) {                                            \
+                fprintf(stderr, "[%s][%s][%s][T%lu][%s:%d] " fmt "\n",         \
+                        LOG_TIMESTAMP(), lvlstr, __func__,                     \
+                        (unsigned long)pthread_self(), __FILE__, __LINE__,     \
+                        ##__VA_ARGS__);                                        \
+            } else {                                                           \
+                fprintf(stderr, "[%s][%s][%s] " fmt "\n",                      \
+                        LOG_TIMESTAMP(), lvlstr, __func__, ##__VA_ARGS__);     \
+            }                                                                  \
+            fflush(stderr);                                                    \
+        }                                                                      \
+    } while(0)
+
+#define LOGE(fmt, ...) LOG_BASE(LOG_ERR , "ERR", fmt, ##__VA_ARGS__)        // 错误
+#define LOGW(fmt, ...) LOG_BASE(LOG_WARN, "WRN", fmt, ##__VA_ARGS__)        // 警告
+#define LOGI(fmt, ...) LOG_BASE(LOG_INFO, "INF", fmt, ##__VA_ARGS__)        // 信息
+#define LOGD(fmt, ...) LOG_BASE(LOG_DBG , "DBG", fmt, ##__VA_ARGS__)        // 调试信息
+#define LOG_SYSERR(msg) LOGE("%s: (%d) %s", msg, errno, strerror(errno))    // 用于替换 perror()
+// ==============================================
+
+#define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
 #define BUFFER_SIZE 8192
 #define MAX_MESSAGE_SIZE 65535
@@ -21,10 +71,12 @@
 
 // 连接结构体
 struct Commloop {
-    int socket;          // 套接字描述符，初始化为 -1，表示无效连接
-    char ip[20];         // 远端服务器的 IP 地址
-    int port;            // 远端服务器的端口号，当 as_server == 1 时该字段为 0
-    int as_server;       // 1 表示被动连接，0 表示主动连接
+    int socket;     // 套接字描述符，初始化为 -1，表示无效连接
+    char ip[20];    // 远端服务器的 IP 地址
+                    // - 当 as_server == 1 时代表允许连接的远端 IP（白名单）
+                    // - 当 as_server == 0 时代表要连接的远端服务器 IP
+    int port;       // 远端服务器的端口号，当 as_server == 1 时无效
+    int as_server;  // 1 表示被动连接，0 表示主动连接
 };
 
 // 发送队列的消息结构
@@ -51,18 +103,23 @@ struct ReceiveBuffer {
 };
 
 // 全局连接数组
+// 当 as_server == 1 时，表示被动连接，本端作为服务端，等待远端连接。每一个远端连接占用这样的一个条目（插槽）
+// 当 as_server == 0 时，表示主动连接，本端作为客户端，主动连接远端服务器
 Commloop g_connections[4] = {
-    {-1, "192.168.0.2", 0,    1},   // 192.168.0.2 的被动连接
-    {-1, "192.168.0.2", 8001, 0},   // 主动连接到 192.168.0.2:8001
-    {-1, "192.168.0.3", 0,    1},   // 192.168.0.3 的被动连接
-    {-1, "192.168.0.3", 8002, 0}    // 主动连接到 192.168.0.3:8002
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 1
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 2
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 3
+    // {-1, "192.168.199.1", 0, 1},   // 本机作为服务端监听 NetAssist
+    {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
 };
 
 // 全局变量
 static int server_fd = -1;
 static int epoll_fd = -1;
 static bool running = true;
+// 互斥锁保护 g_connections 数组及相关资源（如 socket、接收/发送缓冲区）
 static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
+// 互斥锁保护发送队列
 static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 发送队列与缓冲
@@ -71,6 +128,7 @@ static SendBuffer* send_buffers[4] = {NULL, NULL, NULL, NULL};
 static ReceiveBuffer receive_buffers[4];
 
 // 函数声明
+void dummy_function();
 void signal_handler(int sig);
 int create_server_socket();
 int create_client_socket(const char* ip, int port);
@@ -87,48 +145,55 @@ void add_to_send_buffer(int conn_index, const char* data, int length);
 bool send_buffered_data(int conn_index);
 void process_received_message(int conn_index, const char* data, int length);
 void cleanup_connection(int conn_index);
+std::vector<Commloop> load_connections(const std::string& filename);
+void save_connections(const std::string& filename, const std::vector<Commloop>& conns);
 
-// 信号处理：优雅退出
+// 信号处理
 void signal_handler(int sig) {
-    printf("收到信号 %d，正在退出...\n", sig);
+    LOGI("\n收到信号 %d，正在退出...", sig);
     running = false;
 }
 
-// 创建并配置服务器套接字
+// 创建并配置服务器套接字，用于监听连接请求
 int create_server_socket() {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = socket(AF_INET, SOCK_STREAM, 0); // 创建 ipv4 TCP 套接字，返回套接字描述符
     if (sock < 0) {
-        perror("socket");
+        LOG_SYSERR("socket");
         return -1;
     }
 
     int opt = 1;
+    // 设置地址复用
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
+        LOG_SYSERR("setsockopt");
         close(sock);
         return -1;
     }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_family = AF_INET;          // 地址族为 IPv4
+    addr.sin_addr.s_addr = INADDR_ANY;  // 监听所有地址
+    addr.sin_port = htons(SERVER_PORT); // 监听端口 SERVER_PORT，端口转为大端序
 
+    // 绑定套接字到地址
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        LOG_SYSERR("bind");
         close(sock);
         return -1;
     }
 
+    // 开始监听连接
     if (listen(sock, SOMAXCONN) < 0) {
-        perror("listen");
+        LOG_SYSERR("listen");
         close(sock);
         return -1;
     }
 
+    // 设置非阻塞模式
     set_nonblocking(sock);
-    printf("服务器监听端口 %d\n", SERVER_PORT);
+    LOGI("连接监听服务器运行在 %s:%d，套接字描述符: %d",
+         inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), sock);
     return sock;
 }
 
@@ -136,7 +201,7 @@ int create_server_socket() {
 int create_client_socket(const char* ip, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("socket");
+        LOG_SYSERR("socket");
         return -1;
     }
 
@@ -145,22 +210,27 @@ int create_client_socket(const char* ip, int port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
 
+    // 将 IP 地址从字符串转换为二进制格式
     if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-        printf("无效的 IP 地址: %s\n", ip);
+        LOGW("无效的 IP 地址: %s", ip);
         close(sock);
         return -1;
     }
 
+    // 尝试连接到服务器
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_SYSERR("connect");
         close(sock);
         return -1;
     }
 
+    // 设置非阻塞模式
     set_nonblocking(sock);
+    LOGI("已连接到 %s:%d，套接字描述符: %d", ip, port, sock);
     return sock;
 }
 
-// 设置非阻塞
+// 把套接字设为非阻塞模式
 void set_nonblocking(int sock) {
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
@@ -176,12 +246,28 @@ int find_connection_by_socket(int socket) {
     return -1;
 }
 
-// 通过 IP 与类型查找连接下标
+// 通过 IP 与类型查找并分配连接下标
+// 策略：
+// 1) 仅考虑 as_server 匹配的条目
+// 2) IP 精确匹配 或 条目为通配 "0.0.0.0" 视为匹配
+// 3) 返回第一个空槽位
+// 4) 如果有匹配但全被占用返回 -1
+// 5) 如果没有任何匹配，返回 -1
 int find_connection_by_ip_and_type(const char* ip, int as_server) {
+    bool has_match = false;
     for (int i = 0; i < 4; i++) {
-        if (strcmp(g_connections[i].ip, ip) == 0 && g_connections[i].as_server == as_server) {
+        if (g_connections[i].as_server != as_server) continue;
+        bool ip_match = (strcmp(g_connections[i].ip, ip) == 0) ||
+                        (strcmp(g_connections[i].ip, "0.0.0.0") == 0);
+        if (!ip_match) continue;
+        has_match = true;
+        if (g_connections[i].socket == -1) {
             return i;
         }
+    }
+    if (has_match) {
+        // 有匹配但无空槽位
+        LOGW("无空余槽位可分配给来自 %s 的连接，拒绝新连接", ip);
     }
     return -1;
 }
@@ -190,11 +276,12 @@ int find_connection_by_ip_and_type(const char* ip, int as_server) {
 void handle_new_connection(int server_fd) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
+    // 接受新的连接，获得新的套接字描述符用于连接和对端地址
     int client_sock = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
 
     if (client_sock < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("accept");
+            LOG_SYSERR("accept");
         }
         return;
     }
@@ -207,13 +294,12 @@ void handle_new_connection(int server_fd) {
     int conn_index = find_connection_by_ip_and_type(client_ip, 1);
 
     if (conn_index == -1) {
-        printf("拒绝来自未知 IP 的连接: %s\n", client_ip);
+        LOGI("拒绝来自未知 IP %s 的连接", client_ip);
         close(client_sock);
         pthread_mutex_unlock(&connections_mutex);
         return;
     }
 
-    // 如有已存在连接则关闭
     if (g_connections[conn_index].socket != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, g_connections[conn_index].socket, NULL);
         close(g_connections[conn_index].socket);
@@ -231,7 +317,7 @@ void handle_new_connection(int server_fd) {
     // 初始化接收缓冲
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 
-    printf("已接受来自 %s 的被动连接（index %d）\n", client_ip, conn_index);
+    LOGI("已接受来自 %s 的被动连接，作为连接 %d", client_ip, conn_index);
     pthread_mutex_unlock(&connections_mutex);
 }
 
@@ -273,7 +359,7 @@ void handle_client_data(int conn_index) {
             rb->received_bytes = 0; // 重置用于读取消息体
 
             if (rb->expected_length > MAX_MESSAGE_SIZE) {
-                printf("消息过大（%d 字节），断开连接\n", rb->expected_length);
+                LOGW("消息过大（%d 字节），断开连接", rb->expected_length);
                 handle_client_disconnect(conn_index);
                 break;
             }
@@ -290,7 +376,7 @@ void handle_client_data(int conn_index) {
 // 处理连接断开
 void handle_client_disconnect(int conn_index) {
     pthread_mutex_lock(&connections_mutex);
-    printf("连接 %d 已断开\n", conn_index);
+    LOGI("连接 %d 已断开", conn_index);
     cleanup_connection(conn_index);
     pthread_mutex_unlock(&connections_mutex);
 }
@@ -298,7 +384,7 @@ void handle_client_disconnect(int conn_index) {
 // 主动连接远端服务器（用于主动连接项）
 bool connect_to_server(int conn_index) {
     if (g_connections[conn_index].as_server == 1) {
-        return false; // 非主动连接
+        return false; // 检查 as_server 项，避免非预期的调用
     }
 
     int sock = create_client_socket(g_connections[conn_index].ip, g_connections[conn_index].port);
@@ -318,8 +404,8 @@ bool connect_to_server(int conn_index) {
     // 初始化接收缓冲
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 
-    printf("已连接到 %s:%d（index %d）\n",
-           g_connections[conn_index].ip, g_connections[conn_index].port, conn_index);
+    LOGI("已连接到 %s:%d",
+           g_connections[conn_index].ip, g_connections[conn_index].port);
     pthread_mutex_unlock(&connections_mutex);
 
     return true;
@@ -383,7 +469,7 @@ bool send_buffered_data(int conn_index) {
 
 // 处理收到的完整消息
 void process_received_message(int conn_index, const char* data, int length) {
-    printf("收到来自连接 %d 的消息: %.*s\n", conn_index, length, data);
+    LOGI("收到来自连接 %d 的消息: %.*s", conn_index, length, data);
     // 在此加入你的业务处理逻辑
 }
 
@@ -407,7 +493,7 @@ void cleanup_connection(int conn_index) {
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 }
 
-// 连接管理线程——负责主动连接的重连
+// 连接管理线程，用于负责主动连接的重连
 void* connection_manager_thread(void* arg) {
     while (running) {
         sleep(RECONNECT_INTERVAL);
@@ -416,7 +502,7 @@ void* connection_manager_thread(void* arg) {
         for (int i = 0; i < 4; i++) {
             if (g_connections[i].as_server == 0 && g_connections[i].socket == -1) {
                 // 尝试重连主动连接
-                printf("尝试重连到 %s:%d\n",
+                LOGI("尝试重连到 %s:%d",
                        g_connections[i].ip, g_connections[i].port);
                 connect_to_server(i);
             }
@@ -426,7 +512,7 @@ void* connection_manager_thread(void* arg) {
     return NULL;
 }
 
-// 发送线程——消费发送队列
+// 发送线程，消费发送队列
 void* send_thread(void* arg) {
     while (running) {
         pthread_mutex_lock(&send_queue_mutex);
@@ -434,7 +520,7 @@ void* send_thread(void* arg) {
             Message msg = send_queue.front();
             send_queue.pop();
             pthread_mutex_unlock(&send_queue_mutex);
-
+            // 
             pthread_mutex_lock(&connections_mutex);
             if (g_connections[msg.target_index].socket != -1) {
                 add_to_send_buffer(msg.target_index, msg.data, msg.length);
@@ -450,26 +536,58 @@ void* send_thread(void* arg) {
     return NULL;
 }
 
+// 从文件加载连接配置，以 JSON 格式
+std::vector<Commloop> load_connections(const std::string& filename) {
+    std::ifstream fin(filename);
+    json j;
+    fin >> j;
+    std::vector<Commloop> result;
+    for (auto& item : j) {
+        Commloop c;
+        c.socket = item["socket"];
+        strcpy(c.ip, item["ip"].get<std::string>().c_str());
+        c.port = item["port"];
+        c.as_server = item["as_server"];
+        result.push_back(c);
+    }
+    return result;
+}
+
+// 将连接配置保存到文件，以 JSON 格式【未测试】
+void save_connections(const std::string& filename, const std::vector<Commloop>& conns) {
+    json j = json::array();
+    for (const auto& c : conns) {
+        j.push_back({
+            {"socket", c.socket},
+            {"ip", c.ip},
+            {"port", c.port},
+            {"as_server", c.as_server}
+        });
+    }
+    std::ofstream fout(filename);
+    fout << j.dump(4);
+}
+
 // 主函数
 int main() {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, signal_handler);     // 处理 Ctrl+C 终止信号
+    signal(SIGTERM, signal_handler);    // 处理 kill 命令的终止信号
+    signal(SIGPIPE, SIG_IGN);           // 忽略 SIGPIPE 信号，防止写断开的 socket 导致程序退出
 
     // 初始化接收缓冲
     memset(receive_buffers, 0, sizeof(receive_buffers));
 
-    // 创建服务器套接字
+    // 创建服务器套接字，用于监听连接请求
     server_fd = create_server_socket();
     if (server_fd < 0) {
-        fprintf(stderr, "创建服务器套接字失败\n");
+        LOGE("创建服务器套接字失败");
         return 1;
     }
 
-    // 创建 epoll 实例
+    // 创建 epoll 实例，使用 epoll 统一管理所有 socket 的收发和连接状态
     epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
-        perror("epoll_create1");
+        LOG_SYSERR("epoll_create1");
         close(server_fd);
         return 1;
     }
@@ -497,20 +615,21 @@ int main() {
 
     // 主事件循环
     struct epoll_event events[MAX_EVENTS];
-    printf("服务器已启动，进入主循环...\n");
+    LOGI("服务已启动，进入主循环...");
 
     while (running) {
+        // 等待 epoll 管理的 socket 上有事件发生，nfds = num of file descriptors (with events)
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
 
         if (nfds < 0) {
             if (errno == EINTR) continue;
-            perror("epoll_wait");
+            LOG_SYSERR("epoll_wait");
             break;
         }
 
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
-
+            // 当发生事件的文件描述符为服务器套接字时，表示有新的连接请求
             if (fd == server_fd) {
                 // 新的被动连接
                 handle_new_connection(server_fd);
@@ -518,9 +637,11 @@ int main() {
                 // 已有连接上的事件
                 int conn_index = find_connection_by_socket(fd);
                 if (conn_index != -1) {
+                    // 有数据可读
                     if (events[i].events & EPOLLIN) {
                         handle_client_data(conn_index);
                     }
+                    // 有数据可写
                     if (events[i].events & EPOLLOUT) {
                         pthread_mutex_lock(&connections_mutex);
                         if (!send_buffered_data(conn_index)) {
@@ -528,6 +649,7 @@ int main() {
                         }
                         pthread_mutex_unlock(&connections_mutex);
                     }
+                    // 连接关闭或错误
                     if (events[i].events & (EPOLLHUP | EPOLLERR)) {
                         handle_client_disconnect(conn_index);
                     }
@@ -537,7 +659,7 @@ int main() {
     }
 
     // 清理
-    printf("正在关闭...\n");
+    LOGI("正在关闭...");
 
     pthread_cancel(conn_manager_tid);
     pthread_cancel(send_tid);
@@ -554,6 +676,6 @@ int main() {
     pthread_mutex_destroy(&connections_mutex);
     pthread_mutex_destroy(&send_queue_mutex);
 
-    printf("关闭完成\n");
+    LOGI("关闭完成");
     return 0;
 }
