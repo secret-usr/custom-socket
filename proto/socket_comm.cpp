@@ -20,6 +20,7 @@
 #include <fstream>
 #include <vector>
 #include <time.h>
+#include <string> 
 
 #include "include/nlohmann/json.hpp"
 using json = nlohmann::json;
@@ -64,6 +65,7 @@ static inline const char* LOG_TIMESTAMP() {
 // ==============================================
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
+#define CONNECTION_CAPACITY 4   // 最大连接槽位数量
 #define MAX_EVENTS 10
 #define BUFFER_SIZE 8192
 #define MAX_MESSAGE_SIZE 65535
@@ -81,16 +83,16 @@ struct Commloop {
 
 // 发送队列的消息结构
 struct Message {
-    char* data;
-    int length;
-    int target_index;  // 在 g_connections 数组中的目标下标
+    char* data;         // 待发送数据，不包含 2 字节长度头
+    int length;         // 数据长度
+    int target_index;   // 在 g_connections 数组中的目标下标
 };
 
-// 每个连接的发送缓冲链
+// 发送缓冲链
 struct SendBuffer {
-    char* data;
-    int total_length;
-    int sent_bytes;
+    char* data;         // 当前节点的待发送数据，已经包含 2 字节长度头
+    int total_length;   // 当前节点的数据总长度
+    int sent_bytes;     // 已发送的字节数
     struct SendBuffer* next;
 };
 
@@ -105,12 +107,12 @@ struct ReceiveBuffer {
 // 全局连接数组
 // 当 as_server == 1 时，表示被动连接，本端作为服务端，等待远端连接。每一个远端连接占用这样的一个条目（插槽）
 // 当 as_server == 0 时，表示主动连接，本端作为客户端，主动连接远端服务器
-Commloop g_connections[4] = {
-    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 1
-    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 2
-    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 3
-    // {-1, "192.168.199.1", 0, 1},   // 本机作为服务端监听 NetAssist
-    {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
+Commloop g_connections[CONNECTION_CAPACITY] = {
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #0
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #1
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
+    {-1, "192.168.199.1", 0, 1},   // 本机作为服务端监听 NetAssist
+    // {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
 };
 
 // 全局变量
@@ -123,9 +125,9 @@ static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 发送队列与缓冲
-static std::queue<Message> send_queue;
-static SendBuffer* send_buffers[4] = {NULL, NULL, NULL, NULL};
-static ReceiveBuffer receive_buffers[4];
+static std::queue<Message> send_queue;                            // 发送队列
+static SendBuffer* send_buffers[CONNECTION_CAPACITY] = {};        // 每个连接的发送缓冲链头指针
+static ReceiveBuffer receive_buffers[CONNECTION_CAPACITY];
 
 // 函数声明
 void dummy_function();
@@ -143,6 +145,7 @@ void handle_client_disconnect(int conn_index);
 bool connect_to_server(int conn_index);
 void add_to_send_buffer(int conn_index, const char* data, int length);
 bool send_buffered_data(int conn_index);
+bool add_to_send_queue_std_string(int conn_index, const std::string& data);
 void process_received_message(int conn_index, const char* data, int length);
 void cleanup_connection(int conn_index);
 std::vector<Commloop> load_connections(const std::string& filename);
@@ -238,7 +241,7 @@ void set_nonblocking(int sock) {
 
 // 通过套接字描述符查找连接下标
 int find_connection_by_socket(int socket) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
         if (g_connections[i].socket == socket) {
             return i;
         }
@@ -255,7 +258,7 @@ int find_connection_by_socket(int socket) {
 // 5) 如果没有任何匹配，返回 -1
 int find_connection_by_ip_and_type(const char* ip, int as_server) {
     bool has_match = false;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
         if (g_connections[i].as_server != as_server) continue;
         bool ip_match = (strcmp(g_connections[i].ip, ip) == 0) ||
                         (strcmp(g_connections[i].ip, "0.0.0.0") == 0);
@@ -310,6 +313,15 @@ void handle_new_connection(int server_fd) {
 
     // 加入 epoll
     struct epoll_event ev;
+    // NOTE
+    // 在被动连接中，当 EPOLLOUT 事件触发时，如果 send_thread 尚未将队列中的消息添加到 send_buffers 中，
+    // 那么 send_buffered_data 会发现缓冲为空，无法发送数据。
+    // 在程序中主动发送消息的流程如下：
+    // 1. 调用 add_to_send_queue_std_string 将消息加入 send_queue
+    // 2. 等待 send_thread 线程将消息从 send_queue 移动到 send_buffers
+    // 3. 等待 epoll 触发 EPOLLOUT 事件，调用 send_buffered_data 发送数据
+    // 如果采用边缘触发，那么直到下次写操作失败导致不可写状态，恢复可写状态时才会发送这个消息，造成发送延迟。
+    // 目前的解决方案是：send_thread 中处理消息后立即尝试发送一次数据
     ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
     ev.data.fd = client_sock;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &ev);
@@ -318,6 +330,7 @@ void handle_new_connection(int server_fd) {
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 
     LOGI("已接受来自 %s 的被动连接，作为连接 %d", client_ip, conn_index);
+    add_to_send_queue_std_string(conn_index, "hello");
     pthread_mutex_unlock(&connections_mutex);
 }
 
@@ -419,7 +432,7 @@ void add_to_send_buffer(int conn_index, const char* data, int length) {
     new_buffer->sent_bytes = 0;
     new_buffer->next = NULL;
 
-    // 写入长度头
+    // 写入长度头，包装成消息格式
     uint16_t msg_len = htons(length);
     memcpy(new_buffer->data, &msg_len, 2);
     memcpy(new_buffer->data + 2, data, length);
@@ -436,28 +449,41 @@ void add_to_send_buffer(int conn_index, const char* data, int length) {
     }
 }
 
-// 发送缓冲链中的数据（处理部分发送）
+// 尝试发送缓冲链中的数据
 bool send_buffered_data(int conn_index) {
     int sock = g_connections[conn_index].socket;
     if (sock == -1) return false;
 
     while (send_buffers[conn_index] != NULL) {
+        // 拷贝当前缓冲
         SendBuffer* buffer = send_buffers[conn_index];
+        // 计算剩余的未发送字符，并发送这些字符
         int remaining = buffer->total_length - buffer->sent_bytes;
-
         int sent = send(sock, buffer->data + buffer->sent_bytes, remaining, MSG_NOSIGNAL);
-        if (sent <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return true; // 会阻塞，稍后再试
-            } else {
-                return false; // 发生错误
-            }
+
+        if (sent > 0) {
+            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节；前 %d 字节：%.*s", 
+                conn_index, remaining, sent, 
+                (int)std::min(static_cast<size_t>(sent), static_cast<size_t>(80)),
+                (int)std::min(static_cast<size_t>(sent), static_cast<size_t>(80)),
+                buffer->data + buffer->sent_bytes);
+        } else {
+            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节（失败或无数据）", 
+                conn_index, remaining, sent);
         }
 
+        if (sent <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;    // 内核发送缓冲满，稍后再试
+            } else {
+                return false;   // 发生其他错误
+            }
+        }
+        // 更新已发送字节数            
         buffer->sent_bytes += sent;
 
+        // 如果当前缓冲已全部发送，释放该节点
         if (buffer->sent_bytes >= buffer->total_length) {
-            // 当前缓冲已全部发送，移除
             send_buffers[conn_index] = buffer->next;
             free(buffer->data);
             free(buffer);
@@ -499,7 +525,7 @@ void* connection_manager_thread(void* arg) {
         sleep(RECONNECT_INTERVAL);
 
         pthread_mutex_lock(&connections_mutex);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < CONNECTION_CAPACITY; i++) {
             if (g_connections[i].as_server == 0 && g_connections[i].socket == -1) {
                 // 尝试重连主动连接
                 LOGI("尝试重连到 %s:%d",
@@ -520,23 +546,74 @@ void* send_thread(void* arg) {
             Message msg = send_queue.front();
             send_queue.pop();
             pthread_mutex_unlock(&send_queue_mutex);
-            // 
+            // 此处对 g_connections 数组对应的缓冲进行加锁
             pthread_mutex_lock(&connections_mutex);
             if (g_connections[msg.target_index].socket != -1) {
+                // 将发送数据加入对应连接的发送缓冲
                 add_to_send_buffer(msg.target_index, msg.data, msg.length);
+                // 立即尝试一次发送
+                send_buffered_data(msg.target_index);
             }
             pthread_mutex_unlock(&connections_mutex);
 
             free(msg.data);
         } else {
             pthread_mutex_unlock(&send_queue_mutex);
-            usleep(1000); // 1 毫秒
+            usleep(1000); // 如果发送队列为空，等 1000 ms 再次检查
         }
     }
     return NULL;
 }
 
-// 从文件加载连接配置，以 JSON 格式
+// 将数据加入到发送队列，使用 std::string 作为输入
+// 如果数据长度超过 MAX_MESSAGE_SIZE，则拆分为多段发送
+bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
+    if (conn_index < 0 || conn_index >= CONNECTION_CAPACITY) {
+        LOGW("参数非法 conn_index=%d", conn_index);
+        return false;
+    }
+    if (data.empty()) {
+        LOGW("数据为空 conn_index=%d", conn_index);
+        return false;
+    }
+
+    size_t total = data.size();
+    size_t offset = 0;
+    int chunks = 0;
+
+    pthread_mutex_lock(&send_queue_mutex);
+    while (offset < total) {
+        size_t chunk_len = std::min(static_cast<size_t>(MAX_MESSAGE_SIZE),
+                                    total - offset);
+
+        Message msg;
+        msg.length = static_cast<int>(chunk_len);
+        msg.target_index = conn_index;
+        msg.data = (char*)malloc(chunk_len);
+        if (!msg.data) {
+            LOGE("内存分配失败 chunk_len=%zu", chunk_len);
+            // 已经排入的保持；退出
+            pthread_mutex_unlock(&send_queue_mutex);
+            return false;
+        }
+        memcpy(msg.data, data.data() + offset, chunk_len);
+        send_queue.push(msg);
+
+        offset += chunk_len;
+        ++chunks;
+    }
+    pthread_mutex_unlock(&send_queue_mutex);
+
+    LOGI("已将消息加入发送队列，目标连接 %d，总长度 %zu 字节，共分 %d 段；前 %d 字节：%.*s",
+         conn_index, total, chunks,
+         (int)std::min(total, static_cast<size_t>(80)),
+         (int)std::min(total, static_cast<size_t>(80)),
+         data.data());
+
+    return true;
+}
+
+// 从文件加载连接配置，以 JSON 格式【未测试】
 std::vector<Commloop> load_connections(const std::string& filename) {
     std::ifstream fin(filename);
     json j;
@@ -553,7 +630,7 @@ std::vector<Commloop> load_connections(const std::string& filename) {
     return result;
 }
 
-// 将连接配置保存到文件，以 JSON 格式【未测试】
+// 将连接配置保存到文件，以 JSON 格式
 void save_connections(const std::string& filename, const std::vector<Commloop>& conns) {
     json j = json::array();
     for (const auto& c : conns) {
@@ -596,10 +673,11 @@ int main() {
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
+    // 向 epoll 对象中添加感兴趣的事件，socket server_fd 的可读事件
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
     // 主动连接远端服务器
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
         if (g_connections[i].as_server == 0) {
             connect_to_server(i);
         }
@@ -618,7 +696,7 @@ int main() {
     LOGI("服务已启动，进入主循环...");
 
     while (running) {
-        // 等待 epoll 管理的 socket 上有事件发生，nfds = num of file descriptors (with events)
+        // 收集在 epoll 监控的事件中已经发生的事件，如果 epoll 中没有任何一个事件发生，则最多等待 1000ms
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
 
         if (nfds < 0) {
@@ -637,12 +715,14 @@ int main() {
                 // 已有连接上的事件
                 int conn_index = find_connection_by_socket(fd);
                 if (conn_index != -1) {
-                    // 有数据可读
+                    // 表示对应的文件描述符可以读（包括对端SOCKET正常关闭）
                     if (events[i].events & EPOLLIN) {
+                        LOGI("EPOLL 发现连接 %d 有数据可读", conn_index);
                         handle_client_data(conn_index);
                     }
-                    // 有数据可写
+                    // 表示对应的文件描述符可以写，此时尝试发送缓冲区的数据
                     if (events[i].events & EPOLLOUT) {
+                        LOGI("EPOLL 发现连接 %d 可写，尝试发送缓冲区数据", conn_index);
                         pthread_mutex_lock(&connections_mutex);
                         if (!send_buffered_data(conn_index)) {
                             handle_client_disconnect(conn_index);
@@ -666,7 +746,7 @@ int main() {
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
         cleanup_connection(i);
     }
 
