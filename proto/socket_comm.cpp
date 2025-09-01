@@ -110,9 +110,9 @@ struct ReceiveBuffer {
 Commloop g_connections[CONNECTION_CAPACITY] = {
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #0
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #1
-    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
+    // {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
     {-1, "192.168.199.1", 0, 1},   // 本机作为服务端监听 NetAssist
-    // {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
+    {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
 };
 
 // 全局变量
@@ -153,7 +153,7 @@ void save_connections(const std::string& filename, const std::vector<Commloop>& 
 
 // 信号处理
 void signal_handler(int sig) {
-    LOGI("\n收到信号 %d，正在退出...", sig);
+    LOGI("收到信号 %d，正在退出...", sig);
     running = false;
 }
 
@@ -321,6 +321,7 @@ void handle_new_connection(int server_fd) {
     // 2. 等待 send_thread 线程将消息从 send_queue 移动到 send_buffers
     // 3. 等待 epoll 触发 EPOLLOUT 事件，调用 send_buffered_data 发送数据
     // 如果采用边缘触发，那么直到下次写操作失败导致不可写状态，恢复可写状态时才会发送这个消息，造成发送延迟。
+    // 经过调试，当连接有数据可读时，EPOLLIN 会触发，同时 EPOLLOUT 也会触发。从而，上面的情况下，消息延迟会等到下一次接收数据时才发送。
     // 目前的解决方案是：send_thread 中处理消息后立即尝试发送一次数据
     ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
     ev.data.fd = client_sock;
@@ -388,13 +389,11 @@ void handle_client_data(int conn_index) {
 
 // 处理连接断开
 void handle_client_disconnect(int conn_index) {
-    pthread_mutex_lock(&connections_mutex);
     LOGI("连接 %d 已断开", conn_index);
     cleanup_connection(conn_index);
-    pthread_mutex_unlock(&connections_mutex);
 }
 
-// 主动连接远端服务器（用于主动连接项）
+// 主动连接远端服务器
 bool connect_to_server(int conn_index) {
     if (g_connections[conn_index].as_server == 1) {
         return false; // 检查 as_server 项，避免非预期的调用
@@ -415,6 +414,7 @@ bool connect_to_server(int conn_index) {
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
 
     // 初始化接收缓冲
+    // 每次重连也会重置接收缓冲
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 
     LOGI("已连接到 %s:%d",
@@ -424,7 +424,7 @@ bool connect_to_server(int conn_index) {
     return true;
 }
 
-// 将数据加入发送缓冲链
+// 将数据加入发送缓冲链，调用时需持有 connections_mutex 锁
 void add_to_send_buffer(int conn_index, const char* data, int length) {
     SendBuffer* new_buffer = (SendBuffer*)malloc(sizeof(SendBuffer));
     new_buffer->total_length = length + 2; // 包含 2 字节长度头
@@ -449,7 +449,7 @@ void add_to_send_buffer(int conn_index, const char* data, int length) {
     }
 }
 
-// 尝试发送缓冲链中的数据
+// 尝试发送缓冲链中的数据，调用时需持有 connections_mutex 锁
 bool send_buffered_data(int conn_index) {
     int sock = g_connections[conn_index].socket;
     if (sock == -1) return false;
@@ -496,11 +496,15 @@ bool send_buffered_data(int conn_index) {
 // 处理收到的完整消息
 void process_received_message(int conn_index, const char* data, int length) {
     LOGI("收到来自连接 %d 的消息: %.*s", conn_index, length, data);
-    // 在此加入你的业务处理逻辑
+    // ======================
+    // 在此加入业务处理逻辑
+    // ======================
 }
 
 // 清理连接（从 epoll 移除、关闭、清空缓冲）
 void cleanup_connection(int conn_index) {
+    pthread_mutex_lock(&connections_mutex);
+
     if (g_connections[conn_index].socket != -1) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, g_connections[conn_index].socket, NULL);
         close(g_connections[conn_index].socket);
@@ -517,6 +521,8 @@ void cleanup_connection(int conn_index) {
 
     // 清空接收缓冲
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
+
+    pthread_mutex_unlock(&connections_mutex);
 }
 
 // 连接管理线程，用于负责主动连接的重连
@@ -524,16 +530,17 @@ void* connection_manager_thread(void* arg) {
     while (running) {
         sleep(RECONNECT_INTERVAL);
 
-        pthread_mutex_lock(&connections_mutex);
         for (int i = 0; i < CONNECTION_CAPACITY; i++) {
-            if (g_connections[i].as_server == 0 && g_connections[i].socket == -1) {
-                // 尝试重连主动连接
+            // 只在检查状态时加锁，防止与 connect_to_server 的内部加锁发生死锁
+            pthread_mutex_lock(&connections_mutex);
+            bool need_reconnect = g_connections[i].as_server == 0 && g_connections[i].socket == -1;
+            pthread_mutex_unlock(&connections_mutex);
+            if (need_reconnect) {
                 LOGI("尝试重连到 %s:%d",
-                       g_connections[i].ip, g_connections[i].port);
+                     g_connections[i].ip, g_connections[i].port);
                 connect_to_server(i);
             }
         }
-        pthread_mutex_unlock(&connections_mutex);
     }
     return NULL;
 }
@@ -717,17 +724,18 @@ int main() {
                 if (conn_index != -1) {
                     // 表示对应的文件描述符可以读（包括对端SOCKET正常关闭）
                     if (events[i].events & EPOLLIN) {
-                        LOGI("EPOLL 发现连接 %d 有数据可读", conn_index);
+                        LOGI("EPOLL 发现连接 %d 有数据可读，尝试读取数据", conn_index);
                         handle_client_data(conn_index);
                     }
                     // 表示对应的文件描述符可以写，此时尝试发送缓冲区的数据
                     if (events[i].events & EPOLLOUT) {
                         LOGI("EPOLL 发现连接 %d 可写，尝试发送缓冲区数据", conn_index);
                         pthread_mutex_lock(&connections_mutex);
-                        if (!send_buffered_data(conn_index)) {
+                        bool success = send_buffered_data(conn_index);
+                        pthread_mutex_unlock(&connections_mutex);
+                        if (!success) {
                             handle_client_disconnect(conn_index);
                         }
-                        pthread_mutex_unlock(&connections_mutex);
                     }
                     // 连接关闭或错误
                     if (events[i].events & (EPOLLHUP | EPOLLERR)) {

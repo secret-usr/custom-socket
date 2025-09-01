@@ -64,3 +64,10 @@ pthread_mutex_unlock(&send_queue_mutex);
 ```
 
 该程序处理了所有复杂的网络细节，同时为你的应用逻辑提供了清晰的接口。你可以扩展 process_received_message() 来处理入站数据，并使用发送队列机制进行出站数据发送
+
+---
+
+主动发送消息 `add_to_send_queue_std_string()`
+
+BUG：
+1. 程序长时间运行运行，使用 ctrl + C 杀不死程序，需要在另外一个终端 `sudo fuser -k SERVER_PORT/tcp`，例如 `sudo fuser -k 8002/tcp`
