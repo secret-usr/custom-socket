@@ -1,3 +1,41 @@
+
+```
+.
+├── proto
+│   ├── include                         # 第三方库
+│   │   └── nlohmann
+│   │       └── json.hpp
+│   ├── README.md                       # 关于程序本体的 README
+│   └── socket_comm.cpp                 # 程序本体
+├── README.md                           # 本文件，关于完整仓库的 README
+└── utils                               # 杂项工具
+    └── func-call-analyzer              # 分析单文件cpp函数调用关系
+        ├── func-call-analyzer.py
+        └── README.md
+```
+
+本体编译运行：
+
+```
+cd proto
+g++ -o socket_comm socket_comm.cpp -lpthread 
+./socket_comm
+```
+
+每个 `socket_comm` 都可以同时作为服务端 S 和客户端 C，并与其他的 `socket_comm` 进行通信。
+每个 `socket_comm` 都有自己预配置的 `g_connections` 列表，每一个 `Commloop` 项描述一个连接信息，包括 (1) socket 描述符; (2) 连接目标的 IP:port; (3) 自己是否作为服务端。
+`socket_comm` 启动时尝试根据 `g_connections` 列表建立主动连接。
+可能会出现以下情况：
+(1) 成功连接，双方更新 socket 描述符；
+(2) P1 主动连接 P2，但 P2 的 `g_connections` 列表没有对应项，无法成功连接， P1 进入主动连接失败的异常处理流程（假设是尝试重连直到次数达到最大重连次数）；
+(3) P3 的 `g_connections` 列表中有某项作为服务器被 P1 连接，但 P1 的 `g_connections` 列表没有对应项，即没有主动连接的客户端，连接不能建立（这种情况下可以让每个 `socket_comm` 周期性检查 `g_connections` 列表检查出来）；
+(4) ...
+这时 `is_server = 1` 并且 `ip = 0.0.0.0` 就表示接受任何地址的连接请求。
+
+---
+
+以下 LLM 生成。
+
 1. 本机 IP 地址为 192.168.0.1，这可能并不重要。
 2. 本机作为服务器监听 8000 端口。
 3. 有多个客户端需要与本机通信，各客户端的 IP 地址配置在全局数组 g_connections 中。
