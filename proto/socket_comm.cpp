@@ -65,7 +65,6 @@ static inline const char* LOG_TIMESTAMP() {
 // ==============================================
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
-#define CONNECTION_CAPACITY 4   // 最大连接槽位数量
 #define MAX_EVENTS 10
 #define BUFFER_SIZE 8192
 #define MAX_MESSAGE_SIZE 65535
@@ -107,7 +106,7 @@ struct ReceiveBuffer {
 // 全局连接数组
 // 当 as_server == 1 时，表示被动连接，本端作为服务端，等待远端连接。每一个远端连接占用这样的一个条目（插槽）
 // 当 as_server == 0 时，表示主动连接，本端作为客户端，主动连接远端服务器
-Commloop g_connections[CONNECTION_CAPACITY] = {
+Commloop g_connections[] = {
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #0
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #1
     // {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
@@ -116,6 +115,7 @@ Commloop g_connections[CONNECTION_CAPACITY] = {
 };
 
 // 全局变量
+static const int g_connections_len = sizeof(g_connections) / sizeof(Commloop);
 static int server_fd = -1;
 static int epoll_fd = -1;
 static bool running = true;
@@ -125,9 +125,9 @@ static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 发送队列与缓冲
-static std::queue<Message> send_queue;                            // 发送队列
-static SendBuffer* send_buffers[CONNECTION_CAPACITY] = {};        // 每个连接的发送缓冲链头指针
-static ReceiveBuffer receive_buffers[CONNECTION_CAPACITY];
+static std::queue<Message> send_queue;                          // 发送队列
+static SendBuffer* send_buffers[g_connections_len] = {};        // 每个连接的发送缓冲链头指针
+static ReceiveBuffer receive_buffers[g_connections_len];
 
 // 函数声明
 void dummy_function();
@@ -241,7 +241,7 @@ void set_nonblocking(int sock) {
 
 // 通过套接字描述符查找连接下标
 int find_connection_by_socket(int socket) {
-    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
+    for (int i = 0; i < g_connections_len; i++) {
         if (g_connections[i].socket == socket) {
             return i;
         }
@@ -258,7 +258,7 @@ int find_connection_by_socket(int socket) {
 // 5) 如果没有任何匹配，返回 -1
 int find_connection_by_ip_and_type(const char* ip, int as_server) {
     bool has_match = false;
-    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
+    for (int i = 0; i < g_connections_len; i++) {
         if (g_connections[i].as_server != as_server) continue;
         bool ip_match = (strcmp(g_connections[i].ip, ip) == 0) ||
                         (strcmp(g_connections[i].ip, "0.0.0.0") == 0);
@@ -530,7 +530,7 @@ void* connection_manager_thread(void* arg) {
     while (running) {
         sleep(RECONNECT_INTERVAL);
 
-        for (int i = 0; i < CONNECTION_CAPACITY; i++) {
+        for (int i = 0; i < g_connections_len; i++) {
             // 只在检查状态时加锁，防止与 connect_to_server 的内部加锁发生死锁
             pthread_mutex_lock(&connections_mutex);
             bool need_reconnect = g_connections[i].as_server == 0 && g_connections[i].socket == -1;
@@ -575,7 +575,7 @@ void* send_thread(void* arg) {
 // 将数据加入到发送队列，使用 std::string 作为输入
 // 如果数据长度超过 MAX_MESSAGE_SIZE，则拆分为多段发送
 bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
-    if (conn_index < 0 || conn_index >= CONNECTION_CAPACITY) {
+    if (conn_index < 0 || conn_index >= g_connections_len) {
         LOGW("参数非法 conn_index=%d", conn_index);
         return false;
     }
@@ -684,7 +684,7 @@ int main() {
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
     // 主动连接远端服务器
-    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
+    for (int i = 0; i < g_connections_len; i++) {
         if (g_connections[i].as_server == 0) {
             connect_to_server(i);
         }
@@ -754,7 +754,7 @@ int main() {
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
 
-    for (int i = 0; i < CONNECTION_CAPACITY; i++) {
+    for (int i = 0; i < g_connections_len; i++) {
         cleanup_connection(i);
     }
 
