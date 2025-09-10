@@ -34,6 +34,13 @@
 ```bash
 g++ -o socket_comm socket_comm.cpp -lpthread
 ```
+
+现在可以使用 Makefile 进行编译了。
+
+```bash
+make clean && make
+```
+
 - 运行
 ```bash
 ./socket_comm

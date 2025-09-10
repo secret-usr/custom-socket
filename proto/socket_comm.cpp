@@ -19,50 +19,12 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <time.h>
 #include <string> 
 
 #include "include/nlohmann/json.hpp"
 using json = nlohmann::json;
 
-// ================ 日志宏定义 =================
-enum LogLevel { LOG_ERR=0, LOG_WARN=1, LOG_INFO=2, LOG_DBG=3 };
-static int GLOBAL_LOG_LEVEL = LOG_DBG;
-
-static inline const char* LOG_TIMESTAMP() {
-    static char buf[32];
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tmv;
-    localtime_r(&ts.tv_sec, &tmv);
-    int ms = ts.tv_nsec / 1000000;
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
-    return buf;
-}
-
-#define LOG_BASE(lvl, lvlstr, fmt, ...)                                        \
-    do {                                                                       \
-        if ((lvl) <= GLOBAL_LOG_LEVEL) {                                       \
-            if ((lvl) == LOG_DBG) {                                            \
-                fprintf(stderr, "[%s][%s][%s][T%lu][%s:%d] " fmt "\n",         \
-                        LOG_TIMESTAMP(), lvlstr, __func__,                     \
-                        (unsigned long)pthread_self(), __FILE__, __LINE__,     \
-                        ##__VA_ARGS__);                                        \
-            } else {                                                           \
-                fprintf(stderr, "[%s][%s][%s] " fmt "\n",                      \
-                        LOG_TIMESTAMP(), lvlstr, __func__, ##__VA_ARGS__);     \
-            }                                                                  \
-            fflush(stderr);                                                    \
-        }                                                                      \
-    } while(0)
-
-#define LOGE(fmt, ...) LOG_BASE(LOG_ERR , "ERR", fmt, ##__VA_ARGS__)        // 错误
-#define LOGW(fmt, ...) LOG_BASE(LOG_WARN, "WRN", fmt, ##__VA_ARGS__)        // 警告
-#define LOGI(fmt, ...) LOG_BASE(LOG_INFO, "INF", fmt, ##__VA_ARGS__)        // 信息
-#define LOGD(fmt, ...) LOG_BASE(LOG_DBG , "DBG", fmt, ##__VA_ARGS__)        // 调试信息
-#define LOG_SYSERR(msg) LOGE("%s: (%d) %s", msg, errno, strerror(errno))    // 用于替换 perror()
-// ==============================================
+#include "include/log.h"
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
