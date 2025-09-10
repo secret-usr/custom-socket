@@ -63,5 +63,4 @@ make clean && make
 
 主动发送消息 `add_to_send_queue_std_string()`
 
-BUG：
-1. 程序长时间运行运行，使用 ctrl + C 杀不死程序，需要在另外一个终端 `sudo fuser -k SERVER_PORT/tcp`，例如 `sudo fuser -k 8002/tcp`
+可以通过在另外一个终端 `sudo fuser -k SERVER_PORT/tcp` 杀死程序。

@@ -6,7 +6,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <string.h>
-
+#include <algorithm>
 
 // ================ 日志宏定义 =================
 enum LogLevel { LOG_ERR=0, LOG_WARN=1, LOG_INFO=2, LOG_DBG=3 };
@@ -71,6 +71,40 @@ static inline const char* LOG_TIMESTAMP() {
 #define LOGI(fmt, ...) LOG_BASE(LOG_INFO, "INF", fmt, ##__VA_ARGS__)        // 信息
 #define LOGD(fmt, ...) LOG_BASE(LOG_DBG , "DBG", fmt, ##__VA_ARGS__)        // 调试信息
 #define LOG_SYSERR(msg) LOGE("%s: (%d) %s", msg, errno, strerror(errno))    // 用于替换 perror()
+
 // =============================================
+
+// 十六进制转储，把 buf 的前 len 字节转换为十六进制字符串
+// 用例：LOGI("HEX: %s", HEX_DUMP_N(buf, len, 32));
+static inline const char* hex_dump_tls(const void* data, size_t len, size_t max_bytes) {
+    static thread_local char bufs[4][3 * 128 + 8]; // 预览最多 128 字节
+    static thread_local int idx = 0;
+    char* out = bufs[idx];
+    idx = (idx + 1) & 3;
+
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    size_t n = len < max_bytes ? len : max_bytes;
+    if (n > 128) n = 128;
+
+    size_t pos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (pos + 3 >= sizeof(bufs[0])) break;
+        pos += snprintf(out + pos, sizeof(bufs[0]) - pos, "%02X", p[i]);
+        if (i + 1 < n && pos + 2 < sizeof(bufs[0])) {
+            out[pos++] = ' ';
+        }
+    }
+    if (n < len && pos + 5 < sizeof(bufs[0])) {
+        strcpy(out + pos, " ...");
+    } else {
+        out[pos] = '\0';
+    }
+    return out;
+}
+
+// 便捷宏：预览全部（可能受到 128 字节截断）
+#define HEX_DUMP(ptr, len)        hex_dump_tls((ptr), (len), (len))
+// 便捷宏：手动限制预览长度
+#define HEX_DUMP_N(ptr, len, max) hex_dump_tls((ptr), (len), (max))
 
 #endif // LOG_H_

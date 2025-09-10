@@ -24,7 +24,8 @@
 #include "include/nlohmann/json.hpp"
 using json = nlohmann::json;
 
-#include "include/log.h"
+#include "include/log.h" // 日志打印宏, 如 LOGD, LOGI, LOGW, LOGE, LOG_SYSERR
+#include "include/msghead.h" // 电文头定义
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
@@ -44,14 +45,14 @@ struct Commloop {
 
 // 发送队列的消息结构
 struct Message {
-    char* data;         // 待发送数据，不包含 2 字节长度头
+    char* data;         // 待发送数据，不包含电文头
     int length;         // 数据长度
     int target_index;   // 在 g_connections 数组中的目标下标
 };
 
 // 发送缓冲链
 struct SendBuffer {
-    char* data;         // 当前节点的待发送数据，已经包含 2 字节长度头
+    char* data;         // 当前节点的待发送数据，已经包含电文头
     int total_length;   // 当前节点的数据总长度
     int sent_bytes;     // 已发送的字节数
     struct SendBuffer* next;
@@ -217,7 +218,7 @@ int find_connection_by_socket(int socket) {
 // 通过 IP 与类型查找并分配连接下标
 // 策略：
 // 1) 仅考虑 as_server 匹配的条目
-// 2) IP 精确匹配 或 条目为通配 "0.0.0.0" 视为匹配
+// 2) IP 精确匹配视为匹配
 // 3) 返回第一个空槽位
 // 4) 如果有匹配但全被占用返回 -1
 // 5) 如果没有任何匹配，返回 -1
@@ -225,8 +226,7 @@ int find_connection_by_ip_and_type(const char* ip, int as_server) {
     bool has_match = false;
     for (int i = 0; i < g_connections_len; i++) {
         if (g_connections[i].as_server != as_server) continue;
-        bool ip_match = (strcmp(g_connections[i].ip, ip) == 0) ||
-                        (strcmp(g_connections[i].ip, "0.0.0.0") == 0);
+        bool ip_match = (strcmp(g_connections[i].ip, ip) == 0);
         if (!ip_match) continue;
         has_match = true;
         if (g_connections[i].socket == -1) {
@@ -308,10 +308,11 @@ void handle_client_data(int conn_index) {
     while (true) {
         int bytes_to_read;
         int read_offset;
+        int head_len = MsgHead::get_head_length();
 
         if (!rb->header_received) {
-            // 读取消息头（2 字节长度）
-            bytes_to_read = 2 - rb->received_bytes;
+            // 读取消息头
+            bytes_to_read = head_len - rb->received_bytes;
             read_offset = rb->received_bytes;
         } else {
             // 读取消息体
@@ -331,7 +332,7 @@ void handle_client_data(int conn_index) {
 
         rb->received_bytes += bytes_read;
 
-        if (!rb->header_received && rb->received_bytes >= 2) {
+        if (!rb->header_received && rb->received_bytes >= head_len) {
             // 头部读取完成，解析消息长度
             rb->expected_length = ntohs(*(uint16_t*)rb->data);
             rb->header_received = true;
@@ -389,18 +390,20 @@ bool connect_to_server(int conn_index) {
     return true;
 }
 
-// 将数据加入发送缓冲链，调用时需持有 connections_mutex 锁
+// 为数据加上电文头，组装成完整电文后，发送缓冲链，调用时需持有 connections_mutex 锁
 void add_to_send_buffer(int conn_index, const char* data, int length) {
+    int head_len = MsgHead::get_head_length();
     SendBuffer* new_buffer = (SendBuffer*)malloc(sizeof(SendBuffer));
-    new_buffer->total_length = length + 2; // 包含 2 字节长度头
+    new_buffer->total_length = length + head_len; // 此长度包含电文头
     new_buffer->data = (char*)malloc(new_buffer->total_length);
     new_buffer->sent_bytes = 0;
     new_buffer->next = NULL;
 
-    // 写入长度头，包装成消息格式
-    uint16_t msg_len = htons(length);
-    memcpy(new_buffer->data, &msg_len, 2);
-    memcpy(new_buffer->data + 2, data, length);
+    // 生成电文头，组装成完整电文
+    MsgHead msg_head = {};
+    msg_head.msglen = htons(length);
+    memcpy(new_buffer->data, &msg_head, head_len);
+    memcpy(new_buffer->data + head_len, data, length);
 
     // 加到缓冲链末尾
     if (send_buffers[conn_index] == NULL) {
@@ -427,14 +430,12 @@ bool send_buffered_data(int conn_index) {
         int sent = send(sock, buffer->data + buffer->sent_bytes, remaining, MSG_NOSIGNAL);
 
         if (sent > 0) {
-            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节；前 %d 字节：%.*s", 
-                conn_index, remaining, sent, 
-                (int)std::min(static_cast<size_t>(sent), static_cast<size_t>(80)),
-                (int)std::min(static_cast<size_t>(sent), static_cast<size_t>(80)),
-                buffer->data + buffer->sent_bytes);
+            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节；前 %d 字节：%s",
+                 conn_index, remaining, sent, (int)std::min<size_t>(sent, 128),
+                 HEX_DUMP(buffer->data + buffer->sent_bytes, sent));
         } else {
-            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节（失败或无数据）", 
-                conn_index, remaining, sent);
+            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节（失败或无数据）",
+                 conn_index, remaining, sent);
         }
 
         if (sent <= 0) {
@@ -458,9 +459,10 @@ bool send_buffered_data(int conn_index) {
     return true;
 }
 
-// 处理收到的完整消息
+// 处理收到的消息，已由上层函数去除电文头
 void process_received_message(int conn_index, const char* data, int length) {
-    LOGI("收到来自连接 %d 的消息: %.*s", conn_index, length, data);
+    LOGI("来自连接 %d 的消息接收完成，电文体总长度 = %d，前 %d 字节：%s",
+         conn_index, length, (int)std::min<size_t>(length, 128), HEX_DUMP(data, length));
     // ======================
     // 在此加入业务处理逻辑
     // ======================
@@ -603,11 +605,10 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
     pthread_cond_signal(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
 
-    LOGI("已将消息加入发送队列，目标连接 %d，总长度 %zu 字节，共分 %d 段；前 %d 字节：%.*s",
+    LOGI("已将消息加入发送队列，目标连接 %d，总长度 %zu 字节，共分 %d 段；前 %d 字节：%s",
          conn_index, total, chunks,
-         (int)std::min(total, static_cast<size_t>(80)),
-         (int)std::min(total, static_cast<size_t>(80)),
-         data.data());
+         (int)std::min<size_t>(total, 128),
+         HEX_DUMP(data.data(), total));
 
     return true;
 }
