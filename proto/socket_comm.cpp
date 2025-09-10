@@ -123,6 +123,8 @@ static bool running = true;
 static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 互斥锁保护发送队列
 static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+// 发送队列条件变量
+static pthread_cond_t  send_queue_cv    = PTHREAD_COND_INITIALIZER;
 
 // 发送队列与缓冲
 static std::queue<Message> send_queue;                          // 发送队列
@@ -137,6 +139,7 @@ int create_client_socket(const char* ip, int port);
 void set_nonblocking(int sock);
 void* connection_manager_thread(void* arg);
 void* send_thread(void* arg);
+void* get_sendmsg_thread(void* arg);
 int find_connection_by_socket(int socket);
 int find_connection_by_ip_and_type(const char* ip, int as_server);
 void handle_new_connection(int server_fd);
@@ -544,30 +547,54 @@ void* connection_manager_thread(void* arg) {
     }
     return NULL;
 }
-
-// 发送线程，消费发送队列
+// 发送线程，从发送队列取数据并发送
 void* send_thread(void* arg) {
     while (running) {
         pthread_mutex_lock(&send_queue_mutex);
-        if (!send_queue.empty()) {
-            Message msg = send_queue.front();
-            send_queue.pop();
-            pthread_mutex_unlock(&send_queue_mutex);
-            // 此处对 g_connections 数组对应的缓冲进行加锁
-            pthread_mutex_lock(&connections_mutex);
-            if (g_connections[msg.target_index].socket != -1) {
-                // 将发送数据加入对应连接的发送缓冲
-                add_to_send_buffer(msg.target_index, msg.data, msg.length);
-                // 立即尝试一次发送
-                send_buffered_data(msg.target_index);
-            }
-            pthread_mutex_unlock(&connections_mutex);
-
-            free(msg.data);
-        } else {
-            pthread_mutex_unlock(&send_queue_mutex);
-            usleep(1000); // 如果发送队列为空，等 1000 ms 再次检查
+        // 队列空则等待
+        while (send_queue.empty() && running) {
+            // 释放锁并等待条件变量
+            pthread_cond_wait(&send_queue_cv, &send_queue_mutex);
         }
+        if (!running) { // 退出
+            pthread_mutex_unlock(&send_queue_mutex);
+            break;
+        }
+        Message msg = send_queue.front();
+        send_queue.pop();
+        pthread_mutex_unlock(&send_queue_mutex);
+
+        // 此处对 g_connections 数组对应的缓冲进行加锁
+        pthread_mutex_lock(&connections_mutex);
+        
+        if (g_connections[msg.target_index].socket != -1) {
+            // 将发送数据加入对应连接的发送缓冲
+            add_to_send_buffer(msg.target_index, msg.data, msg.length);
+            // 立即尝试一次发送
+            send_buffered_data(msg.target_index);
+        }
+        pthread_mutex_unlock(&connections_mutex);
+
+        free(msg.data);
+    }
+    return NULL;
+}
+
+// 获取待发送电文线程
+// 
+// 一般来讲，此项目仅用于电文的收发，待发送电文是从别的进程获取的。 
+//
+// 未来可在此处阻塞/轮询业务模块或读取文件/消息队列以获取要发送的电文，
+// 然后调用 add_to_send_queue_std_string 推入发送队列。
+void* get_sendmsg_thread(void* arg) {
+    while (running) {
+        // 占位：模拟周期性检查外部来源是否有新电文
+        // 在这里未来可以添加：
+        // 1. 读取文件 / 命名管道 / 消息队列
+        // 2. 从共享内存或业务模块获取待发送消息
+        // 3. 解析并调用 add_to_send_queue_std_string(target_index, data)
+        LOGD("get_sendmsg_thread 周期检查，占位实现");
+        sleep(1); // 休眠 1 秒，避免空转占用 CPU
     }
     return NULL;
 }
@@ -588,6 +615,7 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
     size_t offset = 0;
     int chunks = 0;
 
+    // 再持锁的状态下将数据拆分并加入发送队列, 然后通过条件变量唤醒发送线程
     pthread_mutex_lock(&send_queue_mutex);
     while (offset < total) {
         size_t chunk_len = std::min(static_cast<size_t>(MAX_MESSAGE_SIZE),
@@ -599,7 +627,7 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
         msg.data = (char*)malloc(chunk_len);
         if (!msg.data) {
             LOGE("内存分配失败 chunk_len=%zu", chunk_len);
-            // 已经排入的保持；退出
+            // 已经排入队列的数据保持；退出
             pthread_mutex_unlock(&send_queue_mutex);
             return false;
         }
@@ -609,6 +637,8 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
         offset += chunk_len;
         ++chunks;
     }
+    // 入队完成，唤醒发送线程
+    pthread_cond_signal(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
 
     LOGI("已将消息加入发送队列，目标连接 %d，总长度 %zu 字节，共分 %d 段；前 %d 字节：%.*s",
@@ -698,6 +728,10 @@ int main() {
     pthread_t send_tid;
     pthread_create(&send_tid, NULL, send_thread, NULL);
 
+    // 启动获取待发送电文线程
+    pthread_t get_sendmsg_tid;
+    pthread_create(&get_sendmsg_tid, NULL, get_sendmsg_thread, NULL);
+
     // 主事件循环
     struct epoll_event events[MAX_EVENTS];
     LOGI("服务已启动，进入主循环...");
@@ -749,10 +783,18 @@ int main() {
     // 清理
     LOGI("正在关闭...");
 
+    // 唤醒可能在等待的发送线程
+    pthread_mutex_lock(&send_queue_mutex);
+    pthread_cond_broadcast(&send_queue_cv);
+    pthread_mutex_unlock(&send_queue_mutex);
+
     pthread_cancel(conn_manager_tid);
     pthread_cancel(send_tid);
+    // 取消并等待获取发送电文线程
+    pthread_cancel(get_sendmsg_tid);
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
+    pthread_join(get_sendmsg_tid, NULL);
 
     for (int i = 0; i < g_connections_len; i++) {
         cleanup_connection(i);
@@ -763,6 +805,7 @@ int main() {
 
     pthread_mutex_destroy(&connections_mutex);
     pthread_mutex_destroy(&send_queue_mutex);
+    pthread_cond_destroy(&send_queue_cv);
 
     LOGI("关闭完成");
     return 0;
