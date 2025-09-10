@@ -1,7 +1,13 @@
+# ==================================================================
 # Makefile for compiling socket communication program
+# ==================================================================
+
 # compilor and flags
 CXX = g++
 CXXFLAGS = -lpthread
+
+# NOTE: Default build adds no explicit log-level macro.
+# Program source must provide its own default behavior when no -DDEBUG/-DINFO/-DWARN/-DERROR is given.
 
 # source files and target executable
 SRC = socket_comm.cpp
@@ -17,4 +23,21 @@ $(TARGET): $(SRC)
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all clean
+# log level build targets (force rebuild via clean first)
+# Each target appends a compile-time macro to enable logging scope.
+debug: CXXFLAGS += -DDEBUG
+debug: clean $(TARGET)
+
+info: CXXFLAGS += -DINFO
+info: clean $(TARGET)
+
+warning: CXXFLAGS += -DWARN
+warning: clean $(TARGET)
+
+error: CXXFLAGS += -DERROR
+error: clean $(TARGET)
+
+# build alias equals error log level
+build: error
+
+.PHONY: all clean debug info warning error build
