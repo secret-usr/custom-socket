@@ -14,7 +14,7 @@ SRC = socket_comm.cpp
 TARGET = socket_comm
 
 # default target
-all: $(TARGET)
+all: clean $(TARGET)
 
 $(TARGET): $(SRC)
 	$(CXX) -o $@ $^ $(CXXFLAGS)
@@ -40,4 +40,11 @@ error: clean $(TARGET)
 # build alias equals error log level
 build: error
 
-.PHONY: all clean debug info warning error build
+# generate function call graph for socket_comm.cpp
+# Requires: python3, graphviz (dot)
+callgraph: $(SRC)
+	python3 utils/func-call-analyzer/func-call-analyzer.py $(SRC) --dot callgraph.dot --max-depth 6
+	dot -Tpng callgraph.dot -o callgraph.png
+	rm -f callgraph.dot
+
+.PHONY: all clean debug info warning error build callgraph

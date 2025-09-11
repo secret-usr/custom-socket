@@ -1,7 +1,18 @@
+# Ignore all files without extensions (no dot in filename)
+*
+
+# But do not ignore directories
+!*/
+
+# But do not ignore files with extensions
+!*.*
+
+# Ignore all .json files (overrides the above for .json)
+*.json
+
+# Specific ignores
 NOTE.md
 issues.md
-*.json
+callgraph.png
 utils/func-call-analyzer/*.png
 utils/func-call-analyzer/*.dot
-!*/      # Do not ignore directories
-!*.*     # Do not ignore files with an extension
