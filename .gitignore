@@ -1,0 +1,7 @@
+NOTE.md
+issues.md
+*.json
+utils/func-call-analyzer/*.png
+utils/func-call-analyzer/*.dot
+!*/      # Do not ignore directories
+!*.*     # Do not ignore files with an extension
