@@ -11,7 +11,7 @@
   3) 从 main 出发的调用链枚举（去重，限制深度）  
 
 使用方式：  
-python3 func-call-analyzer.py ../../proto/socket_comm.cpp --dot callgraph.dot --max-depth 6
+python3 func-call-analyzer.py ../../socket_comm.cpp --dot callgraph.dot --max-depth 6
 
 说明/局限：
 - 不解析宏展开、模板多实例、重载区分、命名空间作用域解析与内联定义中的嵌套类方法等复杂情况

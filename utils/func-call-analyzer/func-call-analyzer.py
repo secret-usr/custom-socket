@@ -62,30 +62,55 @@ def extract_brace_block(code:str, brace_pos:int):
     return None, None
 
 def find_calls(body:str, all_func_names:set):
-    calls = set()
+    """找到函数体中的函数调用，返回调用列表（保持顺序）"""
+    calls = []  # 改为列表以保持调用顺序
+    call_positions = []  # 存储调用位置，用于排序
+    
     # 简单：查找 name( 形式
     for name in all_func_names:
+        if name in CONTROL_KEYWORDS:
+            continue
         # 避免把函数名作为更长标识的一部分
-        # (?<!\.) 避免方法链 obj.method?（这里仍可能漏/误，后面可改进）
         pattern = re.compile(r'\b' + re.escape(name) + r'\s*\(')
-        if pattern.search(body):
-            calls.add(name)
-    # 过滤控制关键字
-    return {c for c in calls if c not in CONTROL_KEYWORDS}
+        for match in pattern.finditer(body):
+            call_positions.append((match.start(), name))
+    
+    # 按照在代码中出现的位置排序
+    call_positions.sort(key=lambda x: x[0])
+    
+    # 提取函数名，保持顺序（可能有重复调用）
+    calls = [name for pos, name in call_positions]
+    
+    return calls
 
 def build_call_graph(code:str):
     code_nc = strip_comments(code)
     funcs = find_function_definitions(code_nc)
     names = {f[0] for f in funcs}
-    graph = defaultdict(set)
+    graph = defaultdict(list)  # 改为列表以存储调用顺序和次数
     bodies = {}
     for name, s, e, body in funcs:
         bodies[name] = body
     for name, _, _, body in funcs:
         callees = find_calls(body, names - {name})
-        for cal in callees:
-            graph[name].add(cal)
-    return graph, names
+        # 统计每个被调用函数的调用次数和顺序
+        call_order = {}
+        for i, callee in enumerate(callees):
+            if callee not in call_order:
+                call_order[callee] = []
+            call_order[callee].append(i + 1)  # 调用顺序从1开始
+        
+        # 存储调用信息：(被调用函数, 调用顺序列表)
+        for callee, orders in call_order.items():
+            graph[name].append((callee, orders))
+    
+    # 同时返回简化版本的图用于路径分析
+    simple_graph = defaultdict(set)
+    for caller, call_list in graph.items():
+        for callee, _ in call_list:
+            simple_graph[caller].add(callee)
+    
+    return graph, simple_graph, names
 
 def detect_recursion(graph):
     visited = set()
@@ -137,9 +162,16 @@ def enumerate_paths(graph, start, max_depth=6, limit=2000):
 def output_text(graph):
     lines = []
     for caller in sorted(graph.keys()):
-        callees = sorted(graph[caller])
-        if callees:
-            lines.append(f"{caller} -> {', '.join(callees)}")
+        call_list = graph[caller]
+        if call_list:
+            call_strs = []
+            for callee, orders in call_list:
+                if len(orders) == 1:
+                    call_strs.append(f"{callee}(#{orders[0]})")
+                else:
+                    order_str = ",".join(map(str, orders))
+                    call_strs.append(f"{callee}(#{order_str})")
+            lines.append(f"{caller} -> {', '.join(call_strs)}")
         else:
             lines.append(f"{caller} -> (no calls)")
     return "\n".join(lines)
@@ -147,16 +179,32 @@ def output_text(graph):
 def output_dot(graph):
     out = ["digraph CallGraph {"]
     out.append('  rankdir=LR;')
-    for caller, callees in graph.items():
-        if not callees:
+    out.append('  node [shape=box, style=filled, fillcolor=lightblue];')
+    out.append('  edge [fontsize=10];')
+    
+    for caller, call_list in graph.items():
+        if not call_list:
             out.append(f'  "{caller}";')
-        for cal in callees:
-            out.append(f'  "{caller}" -> "{cal}";')
+        else:
+            for callee, orders in call_list:
+                # 构建边的标签，显示调用顺序
+                if len(orders) == 1:
+                    label = f"#{orders[0]}"
+                else:
+                    label = f"#{','.join(map(str, orders))}"
+                
+                # 根据调用次数调整边的样式
+                if len(orders) > 1:
+                    # 多次调用
+                    out.append(f'  "{caller}" -> "{callee}" [label="{label}"];')
+                else:
+                    out.append(f'  "{caller}" -> "{callee}" [label="{label}"];')
+    
     out.append("}")
     return "\n".join(out)
 
 def main():
-    ap = argparse.ArgumentParser(description="简单 C/C++ 单文件函数调用关系分析")
+    ap = argparse.ArgumentParser(description="简单 C/C++ 单文件函数调用关系分析（支持调用顺序）")
     ap.add_argument("file", help="源文件 (单文件)")
     ap.add_argument("--dot", help="输出 Graphviz dot 文件")
     ap.add_argument("--max-depth", type=int, default=6, help="main 出发路径最大深度")
@@ -165,15 +213,15 @@ def main():
     with open(args.file, 'r', encoding='utf-8', errors='ignore') as f:
         code = f.read()
 
-    graph, names = build_call_graph(code)
+    graph, simple_graph, names = build_call_graph(code)
 
-    print("=== 调用图 (caller -> callees) ===")
+    print("=== 调用图 (caller -> callees with order) ===")
     print(output_text(graph))
     print()
 
     if "main" in names:
         print("=== 从 main 出发的调用链 (深度 <= {}) ===".format(args.max_depth))
-        paths = enumerate_paths(graph, "main", max_depth=args.max_depth)
+        paths = enumerate_paths(simple_graph, "main", max_depth=args.max_depth)
         for p in paths:
             print("  " + " -> ".join(p))
         print("总路径数:", len(paths))
@@ -181,7 +229,7 @@ def main():
     else:
         print("未找到 main，跳过路径枚举\n")
 
-    cycles = detect_recursion(graph)
+    cycles = detect_recursion(simple_graph)
     if cycles:
         print("=== 递归 / 循环调用检测 ===")
         for cyc in cycles:
