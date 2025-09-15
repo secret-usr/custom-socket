@@ -40,6 +40,10 @@ error: clean $(TARGET)
 # build alias equals error log level
 build: error
 
+# run target
+run: clean $(TARGET)
+	./$(TARGET)
+
 # generate function call graph for socket_comm.cpp
 # Requires: python3, graphviz (dot)
 callgraph: $(SRC)
@@ -47,4 +51,4 @@ callgraph: $(SRC)
 	dot -Tpng callgraph.dot -o callgraph.png
 	rm -f callgraph.dot
 
-.PHONY: all clean debug info warning error build callgraph
+.PHONY: all clean debug info warning error build callgraph run
