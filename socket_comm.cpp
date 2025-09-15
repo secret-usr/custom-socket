@@ -29,8 +29,8 @@ using json = nlohmann::json;
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
-#define BUFFER_SIZE 8192
 #define MAX_MESSAGE_SIZE 65535
+#define BUFFER_SIZE MAX_MESSAGE_SIZE
 #define RECONNECT_INTERVAL 5  // 秒
 
 // 连接结构体
@@ -331,6 +331,7 @@ void handle_client_data(int conn_index) {
         }
 
         rb->received_bytes += bytes_read;
+        LOGI("尝试从连接 %d 读取，%d/%d", conn_index , rb->received_bytes, rb->expected_length);
 
         if (!rb->header_received && rb->received_bytes >= head_len) {
             // 头部读取完成，解析消息长度
@@ -721,12 +722,12 @@ int main() {
                 if (conn_index != -1) {
                     // 表示对应的文件描述符可以读（包括对端SOCKET正常关闭）
                     if (events[i].events & EPOLLIN) {
-                        LOGI("EPOLL 发现连接 %d 有数据可读，尝试读取数据", conn_index);
+                        LOGD("EPOLL 发现连接 %d 有数据可读，尝试读取数据", conn_index);
                         handle_client_data(conn_index);
                     }
                     // 表示对应的文件描述符可以写，此时尝试发送缓冲区的数据
                     if (events[i].events & EPOLLOUT) {
-                        LOGI("EPOLL 发现连接 %d 可写，尝试发送缓冲区数据", conn_index);
+                        LOGD("EPOLL 发现连接 %d 可写，尝试发送缓冲区数据", conn_index);
                         pthread_mutex_lock(&connections_mutex);
                         bool success = send_buffered_data(conn_index);
                         pthread_mutex_unlock(&connections_mutex);
