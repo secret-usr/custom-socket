@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import re
 import argparse
@@ -181,24 +180,22 @@ def output_dot(graph):
     out.append('  rankdir=LR;')
     out.append('  node [shape=box, style=filled, fillcolor=lightblue];')
     out.append('  edge [fontsize=10];')
+    out.append('  ordering=out;')  # 添加此行以按定义顺序排列出边
     
     for caller, call_list in graph.items():
         if not call_list:
             out.append(f'  "{caller}";')
         else:
-            for callee, orders in call_list:
+            # 按调用顺序排序：按orders的第一个值（第一次调用顺序）
+            sorted_call_list = sorted(call_list, key=lambda x: x[1][0])
+            for callee, orders in sorted_call_list:
                 # 构建边的标签，显示调用顺序
                 if len(orders) == 1:
                     label = f"#{orders[0]}"
                 else:
                     label = f"#{','.join(map(str, orders))}"
                 
-                # 根据调用次数调整边的样式
-                if len(orders) > 1:
-                    # 多次调用
-                    out.append(f'  "{caller}" -> "{callee}" [label="{label}"];')
-                else:
-                    out.append(f'  "{caller}" -> "{callee}" [label="{label}"];')
+                out.append(f'  "{caller}" -> "{callee}" [label="{label}"];')
     
     out.append("}")
     return "\n".join(out)
