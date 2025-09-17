@@ -331,7 +331,9 @@ void handle_client_data(int conn_index) {
         }
 
         rb->received_bytes += bytes_read;
-        LOGI("尝试从连接 %d 读取，%d/%d", conn_index , rb->received_bytes, rb->expected_length);
+        if (rb->header_received) {
+            LOGI("尝试从连接 %d 读取，%d/%d", conn_index , rb->received_bytes, rb->expected_length);
+        }
 
         if (!rb->header_received && rb->received_bytes >= head_len) {
             // 头部读取完成，解析消息长度
@@ -467,6 +469,8 @@ void process_received_message(int conn_index, const char* data, int length) {
     // ======================
     // 在此加入业务处理逻辑
     // ======================
+    // WARNNING: FOR DEBUG ONLY, REMEMBER TO REMOVE
+    add_to_send_queue_std_string(2, std::string(data, length));
 }
 
 // 清理连接（从 epoll 移除、关闭、清空缓冲）
