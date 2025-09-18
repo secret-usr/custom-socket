@@ -337,7 +337,10 @@ void handle_client_data(int conn_index) {
 
         if (!rb->header_received && rb->received_bytes >= head_len) {
             // 头部读取完成，解析消息长度
-            rb->expected_length = ntohs(*(uint16_t*)rb->data);
+            // 可以确定 rb->data 指针必然已经指向了一个完整的 MsgHead 结构
+            MsgHead* mh = (MsgHead*)rb->data;
+            // 调用这个完整的 MsgHead 结构的成员函数以获取消息体长度
+            rb->expected_length = mh->get_body_length();
             rb->header_received = true;
             rb->received_bytes = 0; // 重置用于读取消息体
 
