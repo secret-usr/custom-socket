@@ -396,7 +396,7 @@ bool connect_to_server(int conn_index) {
     return true;
 }
 
-// 为数据加上电文头，组装成完整电文后，发送缓冲链，调用时需持有 connections_mutex 锁
+// 为数据加上电文头，组装成完整电文后，发送到缓冲链，调用时需持有 connections_mutex 锁
 void add_to_send_buffer(int conn_index, const char* data, int length) {
     int head_len = MsgHead::get_head_length();
     SendBuffer* new_buffer = (SendBuffer*)malloc(sizeof(SendBuffer));
@@ -555,16 +555,15 @@ void* send_thread(void* arg) {
 // 获取待发送电文线程
 // 
 // 一般来讲，此项目仅用于电文的收发，待发送电文是从别的进程获取的。 
-//
-// 未来可在此处阻塞/轮询业务模块或读取文件/消息队列以获取要发送的电文，
-// 然后调用 add_to_send_queue_std_string 推入发送队列。
+// 整个电文（含电文头）应该由业务进程组装，本项目仅负责发送数据。
+// 未来可在此处阻塞/轮询业务模块或读取文件/消息队列以获取要发送的电文。
 void* get_sendmsg_thread(void* arg) {
     while (running) {
         // 占位：模拟周期性检查外部来源是否有新电文
         // 在这里未来可以添加：
         // 1. 读取文件 / 命名管道 / 消息队列
         // 2. 从共享内存或业务模块获取待发送消息
-        // 3. 解析并调用 add_to_send_queue_std_string(target_index, data)
+        // 3. 解析并加入到对应的 send_buffer
         LOGD("get_sendmsg_thread 周期检查，占位实现");
         sleep(1); // 休眠 1 秒，避免空转占用 CPU
     }
