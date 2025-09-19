@@ -89,6 +89,10 @@ static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 发送队列条件变量
 static pthread_cond_t  send_queue_cv    = PTHREAD_COND_INITIALIZER;
 
+// 生命周期条件变量。用于替代 sleep 的定时等待，实现退出时的即时唤醒
+static pthread_mutex_t lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  lifecycle_cv    = PTHREAD_COND_INITIALIZER;
+
 // 发送队列与缓冲
 static std::queue<Message> send_queue;                          // 发送队列
 static SendBuffer* send_buffers[g_connections_len] = {};        // 每个连接的发送缓冲链头指针
@@ -96,6 +100,7 @@ static ReceiveBuffer receive_buffers[g_connections_len];
 
 // 函数声明
 void dummy_function();
+static inline void my_sleep_seconds(int seconds);
 void signal_handler(int sig);
 int create_server_socket();
 int create_client_socket(const char* ip, int port);
@@ -116,6 +121,17 @@ void process_received_message(int conn_index, const char* data, int length);
 void cleanup_connection(int conn_index, bool try_flush);
 std::vector<Commloop> load_connections(const std::string& filename);
 void save_connections(const std::string& filename, const std::vector<Commloop>& conns);
+
+// 使用条件变量和 pthread_cond_timedwait 实现可被唤醒的睡眠
+static inline void my_sleep_seconds(int seconds) {
+    if (seconds <= 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += seconds;
+    pthread_mutex_lock(&lifecycle_mutex);
+    pthread_cond_timedwait(&lifecycle_cv, &lifecycle_mutex, &ts);
+    pthread_mutex_unlock(&lifecycle_mutex);
+}
 
 // 信号处理
 void signal_handler(int sig) {
@@ -520,7 +536,8 @@ void cleanup_connection(int conn_index, bool try_flush = false) {
 // 连接管理线程，用于负责主动连接的重连
 void* connection_manager_thread(void* arg) {
     while (running) {
-        sleep(RECONNECT_INTERVAL);
+        // 等价于 sleep(RECONNECT_INTERVAL);
+        my_sleep_seconds(RECONNECT_INTERVAL);
 
         for (int i = 0; i < g_connections_len; i++) {
             // 只在检查状态时加锁，防止与 connect_to_server 的内部加锁发生死锁
@@ -582,7 +599,8 @@ void* get_sendmsg_thread(void* arg) {
         // 2. 从共享内存或业务模块获取待发送消息
         // 3. 解析并加入到对应的 send_buffer
         LOGD("get_sendmsg_thread 周期检查，占位实现");
-        sleep(1); // 休眠 1 秒，避免空转占用 CPU
+        // 等价于 sleep(1)
+        my_sleep_seconds(1);
     }
     return NULL;
 }
@@ -774,6 +792,10 @@ int main() {
     pthread_mutex_lock(&send_queue_mutex);
     pthread_cond_broadcast(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
+    // 唤醒处于定时等待的线程
+    pthread_mutex_lock(&lifecycle_mutex);
+    pthread_cond_broadcast(&lifecycle_cv);
+    pthread_mutex_unlock(&lifecycle_mutex);
     // 线程将在下一轮检查 running 后自然退出
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
@@ -789,6 +811,8 @@ int main() {
     pthread_mutex_destroy(&connections_mutex);
     pthread_mutex_destroy(&send_queue_mutex);
     pthread_cond_destroy(&send_queue_cv);
+    pthread_mutex_destroy(&lifecycle_mutex);
+    pthread_cond_destroy(&lifecycle_cv);
 
     LOGI("关闭完成");
     return 0;
