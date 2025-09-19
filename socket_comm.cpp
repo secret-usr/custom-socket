@@ -113,7 +113,7 @@ void add_to_send_buffer(int conn_index, const char* data, int length);
 bool send_buffered_data(int conn_index);
 bool add_to_send_queue_std_string(int conn_index, const std::string& data);
 void process_received_message(int conn_index, const char* data, int length);
-void cleanup_connection(int conn_index);
+void cleanup_connection(int conn_index, bool try_flush);
 std::vector<Commloop> load_connections(const std::string& filename);
 void save_connections(const std::string& filename, const std::vector<Commloop>& conns);
 
@@ -306,6 +306,10 @@ void handle_client_data(int conn_index) {
     int sock = g_connections[conn_index].socket;
 
     while (true) {
+        // 在关闭时直接跳出读取循环
+        if (!running) {
+            break;
+        }
         int bytes_to_read;
         int read_offset;
         int head_len = MsgHead::get_head_length();
@@ -362,7 +366,7 @@ void handle_client_data(int conn_index) {
 // 处理连接断开
 void handle_client_disconnect(int conn_index) {
     LOGI("连接 %d 已断开", conn_index);
-    cleanup_connection(conn_index);
+    cleanup_connection(conn_index, false);
 }
 
 // 主动连接远端服务器
@@ -476,11 +480,24 @@ void process_received_message(int conn_index, const char* data, int length) {
     add_to_send_queue_std_string(2, std::string(data, length));
 }
 
-// 清理连接（从 epoll 移除、关闭、清空缓冲）
-void cleanup_connection(int conn_index) {
+// 清理连接
+// 从 epoll 移除、关闭、清空缓冲
+// 参数 try_flush 指示是否在关闭前尝试发送遗留的 send_buffers[conn_index]
+void cleanup_connection(int conn_index, bool try_flush = false) {
     pthread_mutex_lock(&connections_mutex);
 
     if (g_connections[conn_index].socket != -1) {
+        // 关闭前尽量刷新发送缓冲
+        if (try_flush && send_buffers[conn_index] != NULL) {
+            int attempts = 0;
+            while (attempts < 3 && send_buffers[conn_index] != NULL) {
+                bool ok = send_buffered_data(conn_index);
+                ++attempts;
+                if (!ok) break; // 发生错误或不可写则停止
+            }
+            LOGI("cleanup 前刷新连接 %d 的发送缓冲，尝试 %d 次，剩余: %s",
+                 conn_index, attempts, send_buffers[conn_index] ? "未清空" : "已清空");
+        }
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, g_connections[conn_index].socket, NULL);
         close(g_connections[conn_index].socket);
         g_connections[conn_index].socket = -1;
@@ -757,17 +774,13 @@ int main() {
     pthread_mutex_lock(&send_queue_mutex);
     pthread_cond_broadcast(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
-
-    pthread_cancel(conn_manager_tid);
-    pthread_cancel(send_tid);
-    // 取消并等待获取发送电文线程
-    pthread_cancel(get_sendmsg_tid);
+    // 线程将在下一轮检查 running 后自然退出
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
     pthread_join(get_sendmsg_tid, NULL);
 
     for (int i = 0; i < g_connections_len; i++) {
-        cleanup_connection(i);
+        cleanup_connection(i, true);
     }
 
     close(server_fd);
