@@ -89,6 +89,10 @@ static pthread_mutex_t send_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 发送队列条件变量
 static pthread_cond_t  send_queue_cv    = PTHREAD_COND_INITIALIZER;
 
+// 生命周期条件变量。用于替代 sleep 的定时等待，实现退出时的即时唤醒
+static pthread_mutex_t lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  lifecycle_cv    = PTHREAD_COND_INITIALIZER;
+
 // 发送队列与缓冲
 static std::queue<Message> send_queue;                          // 发送队列
 static SendBuffer* send_buffers[g_connections_len] = {};        // 每个连接的发送缓冲链头指针
@@ -96,6 +100,7 @@ static ReceiveBuffer receive_buffers[g_connections_len];
 
 // 函数声明
 void dummy_function();
+static inline void my_sleep_seconds(int seconds);
 void signal_handler(int sig);
 int create_server_socket();
 int create_client_socket(const char* ip, int port);
@@ -113,9 +118,20 @@ void add_to_send_buffer(int conn_index, const char* data, int length);
 bool send_buffered_data(int conn_index);
 bool add_to_send_queue_std_string(int conn_index, const std::string& data);
 void process_received_message(int conn_index, const char* data, int length);
-void cleanup_connection(int conn_index);
+void cleanup_connection(int conn_index, bool try_flush);
 std::vector<Commloop> load_connections(const std::string& filename);
 void save_connections(const std::string& filename, const std::vector<Commloop>& conns);
+
+// 使用条件变量和 pthread_cond_timedwait 实现可被唤醒的睡眠
+static inline void my_sleep_seconds(int seconds) {
+    if (seconds <= 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += seconds;
+    pthread_mutex_lock(&lifecycle_mutex);
+    pthread_cond_timedwait(&lifecycle_cv, &lifecycle_mutex, &ts);
+    pthread_mutex_unlock(&lifecycle_mutex);
+}
 
 // 信号处理
 void signal_handler(int sig) {
@@ -306,6 +322,10 @@ void handle_client_data(int conn_index) {
     int sock = g_connections[conn_index].socket;
 
     while (true) {
+        // 在关闭时直接跳出读取循环
+        if (!running) {
+            break;
+        }
         int bytes_to_read;
         int read_offset;
         int head_len = MsgHead::get_head_length();
@@ -337,7 +357,10 @@ void handle_client_data(int conn_index) {
 
         if (!rb->header_received && rb->received_bytes >= head_len) {
             // 头部读取完成，解析消息长度
-            rb->expected_length = ntohs(*(uint16_t*)rb->data);
+            // 可以确定 rb->data 指针必然已经指向了一个完整的 MsgHead 结构
+            MsgHead* mh = (MsgHead*)rb->data;
+            // 调用这个完整的 MsgHead 结构的成员函数以获取消息体长度
+            rb->expected_length = mh->get_body_length();
             rb->header_received = true;
             rb->received_bytes = 0; // 重置用于读取消息体
 
@@ -359,7 +382,7 @@ void handle_client_data(int conn_index) {
 // 处理连接断开
 void handle_client_disconnect(int conn_index) {
     LOGI("连接 %d 已断开", conn_index);
-    cleanup_connection(conn_index);
+    cleanup_connection(conn_index, false);
 }
 
 // 主动连接远端服务器
@@ -393,7 +416,7 @@ bool connect_to_server(int conn_index) {
     return true;
 }
 
-// 为数据加上电文头，组装成完整电文后，发送缓冲链，调用时需持有 connections_mutex 锁
+// 为数据加上电文头，组装成完整电文后，发送到缓冲链，调用时需持有 connections_mutex 锁
 void add_to_send_buffer(int conn_index, const char* data, int length) {
     int head_len = MsgHead::get_head_length();
     SendBuffer* new_buffer = (SendBuffer*)malloc(sizeof(SendBuffer));
@@ -473,11 +496,24 @@ void process_received_message(int conn_index, const char* data, int length) {
     add_to_send_queue_std_string(2, std::string(data, length));
 }
 
-// 清理连接（从 epoll 移除、关闭、清空缓冲）
-void cleanup_connection(int conn_index) {
+// 清理连接
+// 从 epoll 移除、关闭、清空缓冲
+// 参数 try_flush 指示是否在关闭前尝试发送遗留的 send_buffers[conn_index]
+void cleanup_connection(int conn_index, bool try_flush = false) {
     pthread_mutex_lock(&connections_mutex);
 
     if (g_connections[conn_index].socket != -1) {
+        // 关闭前尽量刷新发送缓冲
+        if (try_flush && send_buffers[conn_index] != NULL) {
+            int attempts = 0;
+            while (attempts < 3 && send_buffers[conn_index] != NULL) {
+                bool ok = send_buffered_data(conn_index);
+                ++attempts;
+                if (!ok) break; // 发生错误或不可写则停止
+            }
+            LOGI("cleanup 前刷新连接 %d 的发送缓冲，尝试 %d 次，剩余: %s",
+                 conn_index, attempts, send_buffers[conn_index] ? "未清空" : "已清空");
+        }
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, g_connections[conn_index].socket, NULL);
         close(g_connections[conn_index].socket);
         g_connections[conn_index].socket = -1;
@@ -500,7 +536,8 @@ void cleanup_connection(int conn_index) {
 // 连接管理线程，用于负责主动连接的重连
 void* connection_manager_thread(void* arg) {
     while (running) {
-        sleep(RECONNECT_INTERVAL);
+        // 等价于 sleep(RECONNECT_INTERVAL);
+        my_sleep_seconds(RECONNECT_INTERVAL);
 
         for (int i = 0; i < g_connections_len; i++) {
             // 只在检查状态时加锁，防止与 connect_to_server 的内部加锁发生死锁
@@ -552,18 +589,18 @@ void* send_thread(void* arg) {
 // 获取待发送电文线程
 // 
 // 一般来讲，此项目仅用于电文的收发，待发送电文是从别的进程获取的。 
-//
-// 未来可在此处阻塞/轮询业务模块或读取文件/消息队列以获取要发送的电文，
-// 然后调用 add_to_send_queue_std_string 推入发送队列。
+// 整个电文（含电文头）应该由业务进程组装，本项目仅负责发送数据。
+// 未来可在此处阻塞/轮询业务模块或读取文件/消息队列以获取要发送的电文。
 void* get_sendmsg_thread(void* arg) {
     while (running) {
         // 占位：模拟周期性检查外部来源是否有新电文
         // 在这里未来可以添加：
         // 1. 读取文件 / 命名管道 / 消息队列
         // 2. 从共享内存或业务模块获取待发送消息
-        // 3. 解析并调用 add_to_send_queue_std_string(target_index, data)
+        // 3. 解析并加入到对应的 send_buffer
         LOGD("get_sendmsg_thread 周期检查，占位实现");
-        sleep(1); // 休眠 1 秒，避免空转占用 CPU
+        // 等价于 sleep(1)
+        my_sleep_seconds(1);
     }
     return NULL;
 }
@@ -755,17 +792,17 @@ int main() {
     pthread_mutex_lock(&send_queue_mutex);
     pthread_cond_broadcast(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
-
-    pthread_cancel(conn_manager_tid);
-    pthread_cancel(send_tid);
-    // 取消并等待获取发送电文线程
-    pthread_cancel(get_sendmsg_tid);
+    // 唤醒处于定时等待的线程
+    pthread_mutex_lock(&lifecycle_mutex);
+    pthread_cond_broadcast(&lifecycle_cv);
+    pthread_mutex_unlock(&lifecycle_mutex);
+    // 线程将在下一轮检查 running 后自然退出
     pthread_join(conn_manager_tid, NULL);
     pthread_join(send_tid, NULL);
     pthread_join(get_sendmsg_tid, NULL);
 
     for (int i = 0; i < g_connections_len; i++) {
-        cleanup_connection(i);
+        cleanup_connection(i, true);
     }
 
     close(server_fd);
@@ -774,6 +811,8 @@ int main() {
     pthread_mutex_destroy(&connections_mutex);
     pthread_mutex_destroy(&send_queue_mutex);
     pthread_cond_destroy(&send_queue_cv);
+    pthread_mutex_destroy(&lifecycle_mutex);
+    pthread_cond_destroy(&lifecycle_cv);
 
     LOGI("关闭完成");
     return 0;
