@@ -107,4 +107,35 @@ static inline const char* hex_dump_tls(const void* data, size_t len, size_t max_
 // 便捷宏：手动限制预览长度
 #define HEX_DUMP_N(ptr, len, max) hex_dump_tls((ptr), (len), (max))
 
+
+// ASCII 转储，把 buf 的前 len 字节转换为 ASCII 字符串（可打印字符显示为对应符号，不可打印显示为 '.'）
+// 用例：LOGI("ASCII: %s", ASCII_DUMP_N(buf, len, 32));
+static inline const char* ascii_dump_tls(const void* data, size_t len, size_t max_bytes) {
+    static thread_local char bufs[4][128 + 8]; // 预览最多 128 字节
+    static thread_local int idx = 0;
+    char* out = bufs[idx];
+    idx = (idx + 1) & 3;
+
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    size_t n = len < max_bytes ? len : max_bytes;
+    if (n > 128) n = 128;
+
+    size_t pos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (pos + 1 >= sizeof(bufs[0])) break;
+        out[pos++] = (p[i] >= 32 && p[i] <= 126) ? p[i] : '.';  // 可打印 ASCII 字符范围
+    }
+    if (n < len && pos + 5 < sizeof(bufs[0])) {
+        strcpy(out + pos, " ...");
+    } else {
+        out[pos] = '\0';
+    }
+    return out;
+}
+
+// 便捷宏：预览全部（可能受到 128 字节截断）
+#define ASCII_DUMP(ptr, len)        ascii_dump_tls((ptr), (len), (len))
+// 便捷宏：手动限制预览长度
+#define ASCII_DUMP_N(ptr, len, max) ascii_dump_tls((ptr), (len), (max))
+
 #endif // LOG_H_
