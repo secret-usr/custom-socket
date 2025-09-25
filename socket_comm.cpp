@@ -29,7 +29,7 @@ using json = nlohmann::json;
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
-#define MAX_MESSAGE_SIZE 65535
+#define MAX_MESSAGE_SIZE 9999
 #define BUFFER_SIZE MAX_MESSAGE_SIZE
 #define RECONNECT_INTERVAL 5  // 秒
 
@@ -427,7 +427,7 @@ void add_to_send_buffer(int conn_index, const char* data, int length) {
 
     // 生成电文头，组装成完整电文
     MsgHead msg_head = {};
-    msg_head.msglen = htons(length);
+    msg_head.random_fill(length);
     memcpy(new_buffer->data, &msg_head, head_len);
     memcpy(new_buffer->data + head_len, data, length);
 
@@ -456,9 +456,10 @@ bool send_buffered_data(int conn_index) {
         int sent = send(sock, buffer->data + buffer->sent_bytes, remaining, MSG_NOSIGNAL);
 
         if (sent > 0) {
-            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节；前 %d 字节：%s",
+            LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节；前 %d 字节：%s (%s)",
                  conn_index, remaining, sent, (int)std::min<size_t>(sent, 128),
-                 HEX_DUMP(buffer->data + buffer->sent_bytes, sent));
+                 HEX_DUMP(buffer->data + buffer->sent_bytes, sent),
+                 ASCII_DUMP(buffer->data + buffer->sent_bytes, sent));
         } else {
             LOGI("尝试发送连接 %d 的缓冲数据 %d 字节，实际发送 %d 字节（失败或无数据）",
                  conn_index, remaining, sent);
@@ -487,8 +488,9 @@ bool send_buffered_data(int conn_index) {
 
 // 处理收到的消息，已由上层函数去除电文头
 void process_received_message(int conn_index, const char* data, int length) {
-    LOGI("来自连接 %d 的消息接收完成，电文体总长度 = %d，前 %d 字节：%s",
-         conn_index, length, (int)std::min<size_t>(length, 128), HEX_DUMP(data, length));
+    LOGI("来自连接 %d 的电文接收完成，电文体总长度 = %d，前 %d 字节：%s (%s)",
+         conn_index, length, (int)std::min<size_t>(length, 128), 
+         HEX_DUMP(data, length), ASCII_DUMP(data, length));
     // ======================
     // 在此加入业务处理逻辑
     // ======================
@@ -647,10 +649,10 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
     pthread_cond_signal(&send_queue_cv);
     pthread_mutex_unlock(&send_queue_mutex);
 
-    LOGI("已将消息加入发送队列，目标连接 %d，总长度 %zu 字节，共分 %d 段；前 %d 字节：%s",
+    LOGI("已将消息加入发送队列，目标连接 %d，消息体总长度 %zu 字节，共分 %d 段；前 %d 字节：%s (%s)",
          conn_index, total, chunks,
          (int)std::min<size_t>(total, 128),
-         HEX_DUMP(data.data(), total));
+         HEX_DUMP(data.data(), total), ASCII_DUMP(data.data(), total));
 
     return true;
 }
