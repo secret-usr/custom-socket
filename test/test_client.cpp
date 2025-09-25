@@ -274,6 +274,7 @@ int main() {
     }
 
     pthread_t threads[NUM_CLIENTS];
+    int num_threads_created = 0;
 
     for (int i = 0; i < NUM_CLIENTS; ++i) {
         g_clients[i].id = i;
@@ -308,6 +309,7 @@ int main() {
             g_running = false;
             break;
         }
+        num_threads_created++;
     }
 
     struct epoll_event events[MAX_EVENTS];
@@ -333,10 +335,8 @@ int main() {
 
     // --- 清理 ---
     printf("Stopping client threads...\n");
-    for (int i = 0; i < NUM_CLIENTS; ++i) {
-        if (threads[i]) {
-            pthread_join(threads[i], NULL);
-        }
+    for (int i = 0; i < num_threads_created; ++i) {
+        pthread_join(threads[i], NULL);
     }
 
     close(epoll_fd);
