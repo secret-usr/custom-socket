@@ -29,8 +29,9 @@ using json = nlohmann::json;
 
 #define SERVER_PORT 8002 // 用于监听连接请求的端口号
 #define MAX_EVENTS 10
-#define MAX_MESSAGE_SIZE 9999
-#define BUFFER_SIZE MAX_MESSAGE_SIZE
+#define MAX_MESSAGE_SIZE 9999 // 最大电文长度
+#define MAX_MESSAGE_BODY_SIZE (MAX_MESSAGE_SIZE - MsgHead::get_head_length())
+#define BUFFER_SIZE (int)(MAX_MESSAGE_SIZE * 1.0) // 接收缓冲区大小，预留 0% 安全冗余
 #define RECONNECT_INTERVAL 5  // 秒
 
 // 连接结构体
@@ -312,7 +313,7 @@ void handle_new_connection(int server_fd) {
     memset(&receive_buffers[conn_index], 0, sizeof(ReceiveBuffer));
 
     LOGI("已接受来自 %s 的被动连接，作为连接 %d", client_ip, conn_index);
-    add_to_send_queue_std_string(conn_index, "hello");
+    // add_to_send_queue_std_string(conn_index, "hello");
     pthread_mutex_unlock(&connections_mutex);
 }
 
@@ -364,7 +365,7 @@ void handle_client_data(int conn_index) {
             rb->header_received = true;
             rb->received_bytes = 0; // 重置用于读取消息体
 
-            if (rb->expected_length > MAX_MESSAGE_SIZE) {
+            if (rb->expected_length > MAX_MESSAGE_BODY_SIZE) {
                 LOGW("消息过大（%d 字节），断开连接", rb->expected_length);
                 handle_client_disconnect(conn_index);
                 break;
@@ -494,8 +495,8 @@ void process_received_message(int conn_index, const char* data, int length) {
     // ======================
     // 在此加入业务处理逻辑
     // ======================
-    // WARNNING: FOR DEBUG ONLY, REMEMBER TO REMOVE
-    add_to_send_queue_std_string(2, std::string(data, length));
+    // 将收到的消息回显给发送方，用于测试
+    add_to_send_queue_std_string(conn_index, std::string(data, length));
 }
 
 // 清理连接
@@ -608,7 +609,7 @@ void* get_sendmsg_thread(void* arg) {
 }
 
 // 将数据加入到发送队列，使用 std::string 作为输入
-// 如果数据长度超过 MAX_MESSAGE_SIZE，则拆分为多段发送
+// 如果数据长度超过 MAX_MESSAGE_BODY_SIZE ，则拆分为多段发送
 bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
     if (conn_index < 0 || conn_index >= g_connections_len) {
         LOGW("参数非法 conn_index=%d", conn_index);
@@ -626,7 +627,7 @@ bool add_to_send_queue_std_string(int conn_index, const std::string& data) {
     // 再持锁的状态下将数据拆分并加入发送队列, 然后通过条件变量唤醒发送线程
     pthread_mutex_lock(&send_queue_mutex);
     while (offset < total) {
-        size_t chunk_len = std::min(static_cast<size_t>(MAX_MESSAGE_SIZE),
+        size_t chunk_len = std::min(static_cast<size_t>(MAX_MESSAGE_BODY_SIZE),
                                     total - offset);
 
         Message msg;
