@@ -73,7 +73,9 @@ struct ReceiveBuffer {
 Commloop g_connections[] = {
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #0
     {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #1
-    // {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #2
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #3
+    {-1, "127.0.0.1", 0, 1},   // 本机作为服务端监听 lo，插槽 #4
     {-1, "192.168.199.1", 0, 1},   // 本机作为服务端监听 NetAssist
     {-1, "192.168.199.1", 8080, 0},    // 本机作为客户端，连接 NetAssist
 };
@@ -365,7 +367,8 @@ void handle_client_data(int conn_index) {
             rb->header_received = true;
             rb->received_bytes = 0; // 重置用于读取消息体
 
-            if (rb->expected_length > MAX_MESSAGE_BODY_SIZE) {
+            // 由于发送方发送的电文出错，导致长度异常，作断开连接处理，以保证本程序正常运行
+            if (rb->expected_length > MAX_MESSAGE_BODY_SIZE || rb->expected_length <= 0) {
                 LOGW("消息过大（%d 字节），断开连接", rb->expected_length);
                 handle_client_disconnect(conn_index);
                 break;
