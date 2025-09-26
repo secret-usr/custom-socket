@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <arpa/inet.h> // For ntohs
+#include <time.h>      // For time() and strftime()
 
 // 电文头的定义
 struct MsgHead
@@ -49,10 +50,13 @@ struct MsgHead
         memcpy(length, temp_string, sizeof(length));
         // 填充 msgid 字段
         memcpy(msgid, "TEST", sizeof(msgid));
-        // 填充 date 字段
-        memcpy(date, "20251231", sizeof(date));
-        // 填充 time 字段
-        memcpy(time, "235959", sizeof(time));
+        // 使用当前系统时间填充 date 和 time 字段
+        time_t now = ::time(nullptr);
+        struct tm* tstruct = localtime(&now);
+        strftime(temp_string, sizeof(date) + 1, "%Y%m%d", tstruct);
+        memcpy(date, temp_string, sizeof(date));
+        strftime(temp_string, sizeof(time) + 1, "%H%M%S", tstruct);
+        memcpy(time, temp_string, sizeof(time));
         // 填充 senddc 字段
         memcpy(senddc, "L3", sizeof(senddc));
         // 填充 recvdc 字段
