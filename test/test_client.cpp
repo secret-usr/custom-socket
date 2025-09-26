@@ -33,11 +33,11 @@
 // --- 配置 ---
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 8002
-#define NUM_CLIENTS 2          // 模拟的客户端数量
+#define NUM_CLIENTS 5          // 模拟的客户端数量
 #define MAX_EVENTS 10
-#define MAX_MESSAGE_BODY_SIZE 9959 // 测试用最大消息体，覆盖分包情况
-#define MIN_MESSAGE_BODY_SIZE 1
-#define SEND_INTERVAL_MS 500   // 每个客户端发送消息的平均间隔
+#define MAX_MESSAGE_BODY_SIZE 10999 // 测试用最大消息体，覆盖分包情况
+#define MIN_MESSAGE_BODY_SIZE 10999
+#define SEND_INTERVAL_MS 100   // 每个客户端发送消息的平均间隔
 
 // --- 全局变量 ---
 static volatile bool g_running = true;
