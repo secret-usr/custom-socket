@@ -27,6 +27,7 @@
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <sstream>
 
 #include "../include/msghead.h"
 
@@ -35,9 +36,10 @@
 #define SERVER_PORT 8002
 #define NUM_CLIENTS 5          // 模拟的客户端数量
 #define MAX_EVENTS 10
-#define MAX_MESSAGE_BODY_SIZE 10999 // 测试用最大消息体，覆盖分包情况
-#define MIN_MESSAGE_BODY_SIZE 10999
+#define MAX_MESSAGE_BODY_SIZE 9949 // 测试用最大消息体，覆盖分包情况
+#define MIN_MESSAGE_BODY_SIZE 1
 #define SEND_INTERVAL_MS 100   // 每个客户端发送消息的平均间隔
+#define MAX_CHUNK_LEN 9999       // 每次 send 的最大分包长度，-1 表示不分包，用于模拟网络分包
 
 // --- 全局变量 ---
 static volatile bool g_running = true;
@@ -118,9 +120,10 @@ int ConnectToServer(const char* ip, int port) {
  * @param client 指向客户端信息的指针
  * @param body 指向消息体的指针
  * @param body_len 消息体的长度
+ * @param max_chunk_len 最大分包长度，默认 -1 表示不分包
  * @return bool 成功发送返回true，失败返回false
  */
-bool SendMessage(ClientInfo* client, const char* body, int body_len) {
+bool SendMessage(ClientInfo* client, const char* body, int body_len, int max_chunk_len = -1) {
     if (client->sock < 0) return false;
 
     int head_len = MsgHead::get_head_length();
@@ -133,8 +136,18 @@ bool SendMessage(ClientInfo* client, const char* body, int body_len) {
     memcpy(message + head_len, body, body_len);
 
     int bytes_sent = 0;
+    int chunk_count = 0;
+    std::vector<int> chunk_sizes;
     while (bytes_sent < total_len) {
-        int ret = send(client->sock, message + bytes_sent, total_len - bytes_sent, 0);
+        int remain = total_len - bytes_sent;
+        int chunk = 0;
+        if (max_chunk_len <= 0) {
+            chunk = remain;
+        } else {
+            int r = rand() % max_chunk_len + 1; // [1, max_chunk_len]
+            chunk = (remain < r) ? remain : r;
+        }
+        int ret = send(client->sock, message + bytes_sent, chunk, 0);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 usleep(10000); // 稍等后重试
@@ -145,11 +158,25 @@ bool SendMessage(ClientInfo* client, const char* body, int body_len) {
             return false;
         }
         bytes_sent += ret;
+        chunk_sizes.push_back(ret);
+        chunk_count++;
     }
-    
+
     client->stats.sent_packets++;
     client->stats.sent_bytes += body_len; // 只统计业务数据
-    printf("Client %d: Sent packet, body %d bytes.\n", client->id, body_len);
+
+    // 打印分包信息
+    std::ostringstream oss;
+    oss << "Client " << client->id << ": Sent packet, body " << body_len << " bytes. (";
+    for (size_t i = 0; i < chunk_sizes.size(); ++i) {
+        if (i == 0) {
+            oss << "=head+" << (chunk_sizes[i] - head_len);
+        } else {
+            oss << "+" << chunk_sizes[i];
+        }
+    }
+    oss << ")";
+    puts(oss.str().c_str());
 
     delete[] message;
     return true;
@@ -239,7 +266,7 @@ void* ClientWorker(void* arg) {
             body[i] = rand() % 256;
         }
 
-        if (!SendMessage(client, body, body_len)) {
+        if (!SendMessage(client, body, body_len, MAX_CHUNK_LEN)) {
             printf("Client %d: Failed to send message. Exiting.\n", client->id);
             delete[] body;
             break;
