@@ -1,0 +1,4 @@
+{
+  "name": "Server Visualizer",
+  "description": "A visual testing tool for a local network server, featuring message queues, automatic protocol matching, and real-time statistics."
+}
